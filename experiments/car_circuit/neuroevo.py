@@ -28,6 +28,7 @@ line. To watch training live, use the app:  python app.py
     python neuroevo.py                                  # train on the classic circuit
     python neuroevo.py --track random --seed 42         # train on a random circuit
     python neuroevo.py --general --tracks 8             # train a generalist driver
+    python neuroevo.py --general --device gpu           # ... simulating on the graphics card
 """
 import argparse
 import glob
@@ -217,19 +218,23 @@ def main():
     ap.add_argument("--tracks", type=int, default=8, help="circuits per generation (generalist)")
     ap.add_argument("--generations", type=int, default=150)
     ap.add_argument("--pop", type=int, default=96, help="networks per generation")
-    ap.add_argument("--workers", type=int, default=None, help="parallel processes")
+    ap.add_argument("--device", choices=["cpu", "gpu"], default="cpu",
+                    help="cpu = one worker process per core, gpu = every car at once on the graphics card")
+    ap.add_argument("--workers", type=int, default=None, help="parallel processes (cpu)")
     ap.add_argument("--evo-seed", type=int, default=0, help="seed of the evolution itself")
     add_track_args(ap)
     args = ap.parse_args()
 
     if args.general:
-        tr = LiveTrainer(args.generations, args.pop, args.workers, args.evo_seed, n_tracks=args.tracks)
+        tr = LiveTrainer(args.generations, args.pop, args.workers, args.evo_seed, n_tracks=args.tracks,
+                         device=args.device)
     else:
         spec = spec_from_args(args)
-        tr = LiveTrainer(args.generations, args.pop, args.workers, args.evo_seed, spec=spec, track=spec.build())
+        tr = LiveTrainer(args.generations, args.pop, args.workers, args.evo_seed, spec=spec,
+                         track=spec.build(), device=args.device)
     print(f"Training: {tr.name}   key {tr.key}")
     print(f"Network: 11 -> {HIDDEN} -> 2  ({Net().size} weights), population {args.pop}, "
-          f"{tr.n_workers} processes\n", flush=True)
+          f"{tr.device_label}\n", flush=True)
 
     os.makedirs(RUNS_DIR, exist_ok=True)
     log_path = os.path.join(RUNS_DIR, f"neuroevo_{tr.key}.csv")

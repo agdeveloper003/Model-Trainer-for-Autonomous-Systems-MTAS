@@ -10,6 +10,7 @@ MTAS app: one window, three screens.
 
     python app.py
 """
+import importlib.util
 import os
 import random
 import time
@@ -24,7 +25,7 @@ from netviz import NetworkView, draw_chart, draw_chart_general
 from neuroevo import Net, list_models, load_model, model_path
 from render import CAR_BODY, CAR_CRASH, FOLLOW_SCALE, TrackView, fmt_time, speed_color
 from track import TrackSpec
-from trainer import CRASHED, DONE, HEADING, LAP_TIME, PROGRESS, SPEED, X, Y, LiveTrainer
+from trainer import CRASHED, DONE, HEADING, LAP_TIME, PROGRESS, SPEED, X, Y, LiveTrainer, gpu_available
 from ui import (ACCENT, BAD, BG, BORDER, GOOD, PANEL, TEXT, TEXT_DIM, WARN, Button, Cycler,
                 NumberField, Segmented, Slider, bar, card, fonts, text, wrap)
 
@@ -121,6 +122,8 @@ class SetupScreen(Screen):
                               self._mode_changed)
         self.grid = Segmented([("3", "3x3 · 6"), ("4", "4x4 · 8"), ("5", "5x5 · 10")], str(app.grid_n),
                               self._mode_changed)
+        self.compute = Segmented([("gpu", "GPU (CUDA)"), ("cpu", f"CPU · {max(1, (os.cpu_count() or 2) - 2)} proc")],
+                                 app.device, self._mode_changed)
         self.gens = Slider("Generations", 10, 1000, 10, app.generations, "{:.0f}")
         self.pop = Slider("Population", 16, 480, 16, app.population, "{:.0f} cars")
 
@@ -130,8 +133,8 @@ class SetupScreen(Screen):
         self.btn_model = Button("Run this model on the track", self._run_model, "primary")
 
         self.widgets = [self.kind, self.seed, self.dice, self.corners, self.length, self.width, self.twist,
-                        self.direction, self.btn_play, self.btn_train, self.mode, self.grid, self.gens,
-                        self.pop, self.model, self.btn_model]
+                        self.direction, self.btn_play, self.btn_train, self.mode, self.grid, self.compute,
+                        self.gens, self.pop, self.model, self.btn_model]
         self.track, self.error, self.view = None, None, None
         self._rebuild_at = 0.0
         self._rebuild()
@@ -145,7 +148,11 @@ class SetupScreen(Screen):
         return f"{m['track_name']}  {lap}"
 
     def _mode_changed(self, *_):
+        if self.mode.value != self.app.train_mode and self.app.has_torch:
+            # the GPU pays off with many cars (generalist); one track with ~100 cars is faster on the CPU
+            self.compute.value = "gpu" if self.mode.value == "general" else "cpu"
         self.app.train_mode, self.app.grid_n = self.mode.value, int(self.grid.value)
+        self.app.device = self.compute.value
 
     # ---------------------------------------------------------- settings
     def _changed(self, *_):
@@ -186,11 +193,14 @@ class SetupScreen(Screen):
             w.enabled = self.kind.value == "random"
         ok = self.track is not None
         general = self.mode.value == "general"
-        self.grid.visible = general
+        if self.grid.visible != general:
+            self.grid.visible = general
+            if hasattr(self, "r_evo"):
+                self._place_evo()
         self.btn_play.enabled = ok
         self.btn_train.enabled = ok or general
-        self.btn_train.sub = (f"generalist: {2 * int(self.grid.value)} new random tracks per generation"
-                              if general else "train neural networks on this track, live")
+        self.btn_train.sub = (f"generalist · {2 * int(self.grid.value)} new circuits per generation"
+                              if general else "train neural networks on this circuit, live")
         self.btn_model.enabled = ok and bool(self.models)
         self.model.enabled = bool(self.models)
         self.app.generations, self.app.population = int(self.gens.value), int(self.pop.value)
@@ -217,41 +227,59 @@ class SetupScreen(Screen):
 
     # ------------------------------------------------------------ layout
     def layout(self, w, h):
-        top = 92
-        self.r_left = pygame.Rect(MARGIN, top, 360, h - top - MARGIN)
-        self.r_right = pygame.Rect(w - MARGIN - 380, top, 380, h - top - MARGIN)
+        compact = h < 860                                     # small windows: tighter spacing
+        self.compact = compact
+        top, bottom = (72 if compact else 92), h - MARGIN
+        self.r_left = pygame.Rect(MARGIN, top, 360, bottom - top)
+        self.r_right = pygame.Rect(w - MARGIN - 380, top, 380, bottom - top)
         self.r_preview = pygame.Rect(self.r_left.right + MARGIN, top,
-                                     self.r_right.x - self.r_left.right - 2 * MARGIN, h - top - MARGIN)
+                                     self.r_right.x - self.r_left.right - 2 * MARGIN, bottom - top)
 
+        # ---- left: track settings, trained models, PLAY
         x, cw = self.r_left.x + 16, self.r_left.w - 32
-        y = self.r_left.y + 40
-        self.kind.rect = pygame.Rect(x, y, cw, 40)
-        y += 56
-        self.seed.rect = pygame.Rect(x, y, cw - 130, 40)
-        self.dice.rect = pygame.Rect(x + cw - 120, y, 120, 40)
-        y += 60
-        for s in (self.corners, self.length, self.width, self.twist):
-            s.rect = pygame.Rect(x, y, cw, 42)
-            y += 60
-        self.direction.rect = pygame.Rect(x, y, cw, 36)
-        y += 50
-        self.info_y = y + 4
+        y = top + 40
+        self.kind.rect = pygame.Rect(x, y, cw, 36 if compact else 40)
+        y += 44 if compact else 52
+        self.seed.rect = pygame.Rect(x, y, cw - 130, 36 if compact else 40)
+        self.dice.rect = pygame.Rect(x + cw - 120, y, 120, 36 if compact else 40)
+        y += 48 if compact else 54
+        for sl in (self.corners, self.length, self.width, self.twist):
+            sl.rect = pygame.Rect(x, y, cw, 42)
+            y += 46 if compact else 56
+        self.direction.rect = pygame.Rect(x, y, cw, 34 if compact else 36)
+        y += 44 if compact else 46
+        self.info_y = y
+        y += (1 if compact else 3) * 22
+        self.r_track = pygame.Rect(self.r_left.x, top, self.r_left.w, y - top + 6)
 
+        play_h = 64 if compact else 84
+        self.btn_play.rect = pygame.Rect(self.r_left.x, bottom - play_h, self.r_left.w, play_h)
+        y = self.r_track.bottom + 14
+        self.r_models = pygame.Rect(self.r_left.x, y, self.r_left.w, self.btn_play.rect.y - 14 - y)
+        self.model.rect = pygame.Rect(x, y + 40, cw, 38)
+        self.btn_model.rect = pygame.Rect(x, self.r_models.bottom - 54, cw, 40)
+
+        # ---- right: neuroevolution settings, NEUROEVOLUTION
         x, cw = self.r_right.x, self.r_right.w
-        y = self.r_right.y
-        self.btn_play.rect = pygame.Rect(x, y, cw, 96)
-        y += 108
-        self.btn_train.rect = pygame.Rect(x, y, cw, 96)
-        y += 110
-        self.r_evo = pygame.Rect(x, y, cw, 246)
-        self.mode.rect = pygame.Rect(x + 16, y + 38, cw - 32, 36)
-        self.grid.rect = pygame.Rect(x + 16, y + 82, cw - 32, 36)
-        self.gens.rect = pygame.Rect(x + 16, y + 132, cw - 32, 42)
-        self.pop.rect = pygame.Rect(x + 16, y + 188, cw - 32, 42)
-        y += 260
-        self.r_models = pygame.Rect(x, y, cw, max(150, self.r_right.bottom - y))
-        self.model.rect = pygame.Rect(x + 16, y + 40, cw - 32, 38)
-        self.btn_model.rect = pygame.Rect(x + 16, self.r_models.bottom - 54, cw - 32, 40)
+        train_h = 90 if compact else 110
+        self.btn_train.rect = pygame.Rect(x, bottom - train_h, cw, train_h)
+        self.r_evo = pygame.Rect(x, top, cw, self.btn_train.rect.y - 14 - top)
+        self._place_evo()
+
+    def _place_evo(self):
+        """Controls of the neuroevolution card; the grid row only exists in generalist mode."""
+        x, cw, y = self.r_evo.x + 16, self.r_evo.w - 32, self.r_evo.y + 38
+        self.mode.rect = pygame.Rect(x, y, cw, 36)
+        y += 44
+        if self.grid.visible:
+            self.grid.rect = pygame.Rect(x, y, cw, 36)
+            y += 44
+        self.compute.rect = pygame.Rect(x, y, cw, 36)
+        y += 50
+        self.gens.rect = pygame.Rect(x, y, cw, 42)
+        y += 56
+        self.pop.rect = pygame.Rect(x, y, cw, 42)
+        self.evo_info_y = y + 64
 
         if self.view:
             self.view.set_rect(self.r_preview.inflate(-2, -2))
@@ -263,22 +291,24 @@ class SetupScreen(Screen):
         text(surf, "Model Trainer for Autonomous Systems", (MARGIN + 110, 36), f.normal, TEXT_DIM)
         text(surf, "set up the circuit, then choose what to do", (w - MARGIN, 36), f.small, TEXT_DIM, "topright")
 
-        card(surf, self.r_left, "Track")
+        # ---- track card
+        card(surf, self.r_track, "Track")
+        x, cw = self.r_track.x + 16, self.r_track.w - 32
         y = self.info_y
         if self.track is not None:
             t = self.track
-            for line in (t.name, f"{t.length / 1000:.2f} km  ·  {t.width:g} m wide",
-                         f"tightest corner radius {t.min_curve_radius():.0f} m"):
-                text(surf, line, (self.r_left.x + 16, y), f.normal, TEXT if line == t.name else TEXT_DIM)
+            lines = ([f"{t.length / 1000:.2f} km · {t.width:g} m · tightest corner {t.min_curve_radius():.0f} m"]
+                     if self.compact else
+                     [t.name, f"{t.length / 1000:.2f} km  ·  {t.width:g} m wide",
+                      f"tightest corner radius {t.min_curve_radius():.0f} m"])
+            for line in lines:
+                text(surf, line, (x, y), f.normal if not self.compact else f.small,
+                     TEXT if line == t.name else TEXT_DIM)
                 y += 22
-            if self.kind.value == "random":
-                y += 8
-                for line in wrap("Same settings + same seed = same circuit, every time.", f.small,
-                                 self.r_left.w - 32):
-                    text(surf, line, (self.r_left.x + 16, y), f.small, TEXT_DIM)
-                    y += 18
+        else:
+            text(surf, "No valid circuit with these settings", (x, y), f.normal, BAD)
 
-        # preview
+        # ---- preview
         pygame.draw.rect(surf, BORDER, self.r_preview, 1, border_radius=10)
         if self.view is not None:
             self.view.begin(surf)
@@ -293,24 +323,47 @@ class SetupScreen(Screen):
                 text(surf, line, (self.r_preview.centerx, yy), f.normal, BAD, "center")
                 yy += 24
 
-        card(surf, self.r_evo, "Neuroevolution settings")
+        # ---- trained models card (runs a saved model on the circuit set up above)
         card(surf, self.r_models, "Trained models")
-        x, y = self.r_models.x + 16, self.r_models.y + 92
+        x, y = self.r_models.x + 16, self.r_models.y + 88
         cw = self.r_models.w - 32
         if not self.models:
             lines = ["No trained models yet.", "Train one with NEUROEVOLUTION:",
-                     "it can then drive any other track."]
+                     "it can then drive any circuit."]
         else:
             m = next(m for m in self.models if m["path"] == self.model.value)
             lines = model_summary(m)
             if self.app.hint_test:
-                lines += ["", "Set up a different circuit on the left,", "then run the model on it."]
+                lines += ["Change the circuit above, then run the model on it."]
         for line in lines:
             for part in wrap(line, f.small, cw):
                 if y < self.btn_model.rect.y - 16:
-                    text(surf, part, (x, y), f.small, ACCENT if self.app.hint_test and line.startswith(("Set", "then"))
-                         else TEXT_DIM)
+                    hint = self.app.hint_test and line.startswith("Change")
+                    text(surf, part, (x, y), f.small, ACCENT if hint else TEXT_DIM)
                 y += 18
+
+        # ---- neuroevolution settings card, with a short description of the chosen mode
+        card(surf, self.r_evo, "Neuroevolution settings")
+        x, cw = self.r_evo.x + 16, self.r_evo.w - 32
+        if self.mode.value == "general":
+            n = 2 * int(self.grid.value)
+            desc = [f"Every generation brings {n} new random circuits (both directions); a network's "
+                    f"score is its average over them, so it has to learn to drive, not to memorise.",
+                    "Every 5 generations the best 3 drive 13 validation circuits they never train on: "
+                    "the saved model is the best one there."]
+        else:
+            desc = ["Every network drives the circuit set up on the left. The model learns it very well, "
+                    "but may only know that one: try it on other circuits with Trained models."]
+        desc.append("GPU: every car at once on the graphics card, best with many cars (generalist). "
+                    if self.compute.value == "gpu" else
+                    "CPU: one worker process per core, best for one track (~100 cars).")
+        y = self.evo_info_y
+        for para in desc:
+            for part in wrap(para, f.small, cw):
+                if y < self.r_evo.bottom - 18:
+                    text(surf, part, (x, y), f.small, TEXT_DIM)
+                y += 18
+            y += 8
 
     def _draw_direction(self, surf):
         """Arrow along the first metres of the track: the driving direction."""
@@ -588,8 +641,12 @@ class TrainScreen(Screen):
     def update(self, dt):
         if self.trainer is None:
             if getattr(self, "_shown_once", False):          # first frame shows "starting..."
+                device = self.app.device
+                if device == "gpu" and not gpu_available():
+                    device = "cpu"                          # no CUDA here: fall back to the CPU workers
                 self.trainer = LiveTrainer(self.app.generations, self.app.population, spec=self.spec,
-                                           track=self.track, n_tracks=self.n_tracks if self.general else None)
+                                           track=self.track, n_tracks=self.n_tracks if self.general else None,
+                                           device=device)
                 self.t_last = time.perf_counter()
             return
         tr = self.trainer
@@ -679,9 +736,11 @@ class TrainScreen(Screen):
         if tr is None:
             self._shown_once = True
             pygame.draw.rect(surf, PANEL, (0, 0, self.PANEL_W, surf.get_height()))
-            n = max(1, min((os.cpu_count() or 2) - 2, self.app.population))
-            center_text(surf, f"Starting {n} worker processes...", surf.get_width() / 2,
-                        surf.get_height() / 2, TEXT, fonts().mid)
+            if self.app.device == "gpu":
+                msg = "Starting the GPU simulation..."
+            else:
+                msg = f"Starting {max(1, min((os.cpu_count() or 2) - 2, self.app.population))} worker processes..."
+            center_text(surf, msg, surf.get_width() / 2, surf.get_height() / 2, TEXT, fonts().mid)
             return
         lead = tr.leader()
         if self.general:
@@ -803,7 +862,7 @@ class TrainScreen(Screen):
             sim = sum(b for _, b in self.speed_hist) / self.STEPS_PER_SECOND
             rows.append(("Speed", f"{sim / max(real, 1e-6):.0f}x real time"))
         rows.append(("Elapsed", fmt_time(time.perf_counter() - tr.started)[:-3]))
-        rows.append(("Workers", f"{tr.n_workers} processes"))
+        rows.append(("Compute", tr.device_label))
         for label, val in rows:
             good = label in ("Record", "Best validation") and val not in ("-", "--:--.--")
             text(surf, label, (x, y), f.normal, TEXT_DIM)
@@ -873,6 +932,8 @@ class App:
         self.model_path = None
         self.hint_test = False
         self.train_mode, self.grid_n = "track", 4
+        self.has_torch = importlib.util.find_spec("torch") is not None
+        self.device = "cpu"                                 # one track by default: CPU is faster there
         self._tracks = {}
         self.view = SetupScreen(self)
 

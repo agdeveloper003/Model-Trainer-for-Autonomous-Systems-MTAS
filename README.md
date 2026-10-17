@@ -55,6 +55,7 @@ Keys: **C** overview / close-up view that rotates with the car · **V** sensors 
 ```bash
 python neuroevo.py --track random --seed 42      # headless training on one track (same results as the app)
 python neuroevo.py --general --tracks 8          # headless generalist training
+python neuroevo.py --general --device gpu        # ... with the simulation on the GPU
 python benchmark.py                              # every saved model on the validation circuits
 python bot.py --track random --seed 42           # rule-based driver: prints a reference lap time
 python track.py --track random --seed 42         # print the stats of a track
@@ -74,6 +75,7 @@ Every script accepts the same track options:
 | `trainer.py` | Training engine: worker processes drive the population on one or many circuits, in step |
 | `neuroevo.py` | Network, scores, genetic algorithm, validation set, saved models; command-line training |
 | `benchmark.py` | Measures saved models on circuits they have never seen, against the rule-based bot |
+| `gpusim.py` | The same simulation for every car at once, on the GPU (PyTorch + a CUDA kernel) |
 | `track.py` | Circuit: control points → spline → centre line, edges, lap progress, ray sensors; seeded random track generator |
 | `car.py` | Physics: bicycle model with a grip limit (too fast in a corner and the car slides wide) |
 | `env.py` | Gymnasium-style environment: `reset()`, `step([steer, throttle])` → observation, reward, end of episode |
@@ -115,9 +117,36 @@ circuit's length, so scores of different circuits can be averaged.
 Models are saved in `checkpoints/neuroevo_<track id>.npz` (generalist: `neuroevo_general-k<K>.npz`);
 the command-line trainer also logs the progress in `runs/`.
 
-Training runs on the **CPU**, in parallel on every core (in the app each worker process drives a
-slice of the population and sends the car positions back every frame): the time goes into the physics simulation, not into
-the tiny network, so a GPU would not help (it would only add CPU↔GPU copies at every step).
+### Compute: CPU or GPU
+
+The time goes into simulating the cars (physics, sensors, track), not into the tiny network. Two engines,
+same rules (choose in the setup screen, or `--device cpu|gpu` on the command line):
+
+- **CPU** — one worker process per core, each driving a slice of the population one car at a time
+  (`env.py`). Best for *This track* (~100 cars: too few to keep a GPU busy).
+- **GPU** — `gpusim.py`: every car of the generation at once, as arrays in PyTorch on the graphics card.
+  Best for *Generalist* (networks × circuits = hundreds or thousands of cars). Three tricks make it fast:
+  each car only tests the walls within sensor range (listed in advance for every point of the track),
+  one simulation step is recorded once as a CUDA graph and replayed, and the sensors run in a custom CUDA
+  kernel compiled at start-up with NVRTC (shipped with PyTorch, no CUDA toolkit needed).
+
+The GPU simulation is checked against the CPU one: on 624 episodes (48 networks × 13 circuits, including
+crashes and stalls) the outcome is the same in 624/624, lap times identical or within one time step.
+Bit-for-bit equality is not possible (the GPU's maths library rounds a few functions differently in the
+last digit), so a training run on the GPU follows a slightly different path than the same run on the CPU.
+Everything stays in float64 like the CPU version: in float32 a few borderline cars crash or survive differently.
+
+| Measured on 32 cores + RTX 5070 Ti | car-steps per second |
+|---|---|
+| CPU, 30 processes | 0.10 M |
+| GPU, 1,000 cars | ~1.7 M |
+| GPU, 5,000+ cars | ~5 M |
+
+Generalist training, 150 generations, 8 circuits, population 96: **40 min on the CPU, 8.4 min on the GPU**
+(the GPU is not full with 768 cars, and at the end of each generation only a few cars are still running).
+A model trained on the GPU drives the same in the CPU simulation used by the app (table below).
+
+The GPU needs PyTorch with CUDA (`pip install torch` from pytorch.org); without it the app uses the CPU.
 
 ### Results (classic circuit, 1.93 km, same simulation time step)
 
@@ -134,7 +163,8 @@ Generalist: 150 generations, 8 new random circuits per generation, population 96
 | Driver | Validation circuits (13) | Test circuits (30 new ones) | Lap time vs bot |
 |---|---|---|---|
 | Rule-based bot | 100% | 97% | 1.00 |
-| Generalist (`general-k8`) | **100%**, no crash | **100%**, no crash | **0.56–0.59** |
+| Generalist (`general-k8`, trained on CPU) | **100%**, no crash | **100%**, no crash | **0.56–0.59** |
+| Generalist (same settings, trained on GPU) | **100%**, no crash | **100%**, no crash | 0.57–0.61 |
 | Specialists (trained on one circuit) | 31–85% | – | 0.55–0.80 where they finish |
 
 The validation circuits also choose which model is saved, so the test circuits (a third set, used only
@@ -143,6 +173,5 @@ for this table) are the honest measure.
 ### Next steps
 
 1. Reinforcement learning (PPO with Stable-Baselines3) through a Gymnasium wrapper.
-2. Faster simulation: all cars as arrays (NumPy, then PyTorch on the GPU) to afford bigger populations
-   and more circuits per generation.
+2. Use the GPU's speed: bigger populations and more circuits per generation.
 3. Richer inputs (more forward rays, slip) and better optimisers (CMA-ES), measured on the validation circuits.
