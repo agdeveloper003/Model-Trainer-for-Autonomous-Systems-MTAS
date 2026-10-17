@@ -11,7 +11,7 @@ Mostra:
     colorata per velocità (rosso = lento, verde = veloce)
   - pannello con velocità, tempi sul giro, progresso, comandi
 
-Tasti gestiti qui: C = cambia vista, V = mostra/nascondi sensori,
+Tasti gestiti qui: C = cambia vista (la vista ravvicinata ruota con la macchina), V = mostra/nascondi sensori,
 R = riparti, ESC = esci.
 """
 import math
@@ -99,20 +99,42 @@ class Renderer:
 
     # ================================================================ vista
     def _view(self):
+        """Ritorna (scala, centro nel mondo, centro sullo schermo, angolo di rotazione).
+
+        Nella vista che segue la macchina il mondo ruota in modo che il muso
+        punti sempre verso l'alto dello schermo.
+        """
+        sc = (PANEL_W + (self.W - PANEL_W) / 2, self.H / 2)
         if self.follow:
-            return FOLLOW_SCALE, self.env.car.pos, (PANEL_W + (self.W - PANEL_W) / 2, self.H / 2)
-        return self.overview_scale, self.overview_center, (PANEL_W + (self.W - PANEL_W) / 2, self.H / 2)
+            return FOLLOW_SCALE, self.env.car.pos.copy(), sc, math.pi / 2 - self.env.car.heading
+        return self.overview_scale, self.overview_center, sc, 0.0
 
     def w2s(self, p):
-        s, c, sc = self._view_cache
-        return (sc[0] + (p[0] - c[0]) * s, sc[1] - (p[1] - c[1]) * s)
+        return self.w2s_many([p])[0]
 
     def w2s_many(self, pts):
-        s, c, sc = self._view_cache
-        pts = np.asarray(pts)
-        x = sc[0] + (pts[:, 0] - c[0]) * s
-        y = sc[1] - (pts[:, 1] - c[1]) * s
+        s, c, sc, a = self._view_cache
+        pts = np.asarray(pts, dtype=float)
+        dx, dy = pts[:, 0] - c[0], pts[:, 1] - c[1]
+        if a:
+            ca, sa = math.cos(a), math.sin(a)
+            dx, dy = ca * dx - sa * dy, sa * dx + ca * dy
+        x = sc[0] + dx * s
+        y = sc[1] - dy * s
         return list(zip(x.tolist(), y.tolist()))
+
+    def _blit_follow_bg(self):
+        """Ritaglia la pista attorno alla macchina, la ruota e la centra sullo schermo."""
+        s, c, sc, a = self._view_cache
+        view_w, view_h = self.W - PANEL_W, self.H
+        side = int(math.hypot(view_w, view_h)) + 4          # copre la vista a qualsiasi angolo
+        px = (c[0] - self.bg_origin[0]) * s
+        py = (self.bg_origin[1] - c[1]) * s
+        crop = pygame.Surface((side, side))
+        crop.fill(GRASS_A)
+        crop.blit(self.bg_follow, (0, 0), pygame.Rect(int(px - side / 2), int(py - side / 2), side, side))
+        rot = pygame.transform.rotate(crop, math.degrees(a))
+        self.screen.blit(rot, rot.get_rect(center=(int(sc[0]), int(sc[1]))))
 
     # ======================================================== sfondo pista
     def _render_track(self, scale, span):
@@ -211,8 +233,10 @@ class Renderer:
         env, car = self.env, self.env.car
 
         self.screen.fill(GRASS_A)
-        bg = self.bg_follow if self.follow else self.bg_overview
-        self.screen.blit(bg, self.w2s(self.bg_origin))
+        if self.follow:
+            self._blit_follow_bg()
+        else:
+            self.screen.blit(self.bg_overview, self.w2s(self.bg_origin))
 
         s = self._view_cache[0]
         width = max(1, int(round(0.8 * s))) if self.follow else 2
