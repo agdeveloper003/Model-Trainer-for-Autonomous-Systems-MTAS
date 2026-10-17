@@ -9,8 +9,8 @@ It only uses the sensors, just like the neural network will:
   - it steers towards the direction where the rays see the most free space;
   - it adjusts its speed to how much room there is ahead.
 
-    python bot.py            # no graphics, prints the lap time
-    python bot.py --render   # watch it drive
+    python bot.py                            # prints the lap time on the classic circuit
+    python bot.py --track random --seed 42   # same on a random circuit
 """
 import argparse
 
@@ -39,30 +39,17 @@ def rule_based_policy(env):
 
 def main():
     ap = argparse.ArgumentParser(description="Rule-based driver (reference lap time).")
-    ap.add_argument("--render", action="store_true", help="show the graphics window")
     ap.add_argument("--laps", type=int, default=1)
     add_track_args(ap)
     args = ap.parse_args()
     track = spec_from_args(args).build()
 
-    if args.render:
-        import pygame
-        from render import Renderer
-        env = CarCircuitEnv(track=track, dt=1 / 60, substeps=1, laps_to_finish=args.laps)
-        renderer = Renderer(env, title="MTAS - rule-based driver")
-    else:
-        env = CarCircuitEnv(track=track, laps_to_finish=args.laps)
-
+    env = CarCircuitEnv(track=track, laps_to_finish=args.laps)
     env.reset()
     total_reward, info = 0.0, {}
     while True:
         _, r, term, trunc, info = env.step(rule_based_policy(env))
         total_reward += r
-        if args.render:
-            if not renderer.handle_events():
-                break
-            renderer.draw()
-            renderer.tick(60)
         if term or trunc:
             break
 
@@ -70,9 +57,6 @@ def main():
     print(f"Outcome: {outcome}")
     print(f"Laps: {info.get('laps')}  times: {[round(t, 2) for t in env.lap_times]}")
     print(f"Progress: {info.get('progress', 0):.1%} of a lap  total reward: {total_reward:.1f}")
-    if args.render:
-        pygame.time.wait(1500)
-        renderer.close()
 
 
 if __name__ == "__main__":

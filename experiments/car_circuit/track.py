@@ -196,6 +196,7 @@ class TrackSpec:
     length: float = 2000.0         # target length in metres
     width: float = 14.0            # track width in metres
     twistiness: float = 0.5        # 0 = almost an oval, 1 = very twisty
+    clockwise: bool = False        # driving direction
 
     LIMITS = {"corners": (5, 24), "length": (800.0, 4000.0),
               "width": (10.0, 20.0), "twistiness": (0.0, 1.0)}
@@ -208,28 +209,35 @@ class TrackSpec:
             length=float(np.clip(self.length, *lim["length"])),
             width=float(np.clip(self.width, *lim["width"])),
             twistiness=float(np.clip(self.twistiness, *lim["twistiness"])),
+            clockwise=bool(self.clockwise),
         )
 
     def track_id(self):
         """Short unique name, used e.g. for the saved network's file name."""
+        cw = "-cw" if self.clockwise else ""
         if self.kind == "classic":
-            return "classic"
+            return "classic" + cw
         s = self.clamped()
-        return f"random-s{s.seed}-c{s.corners}-l{s.length:g}-w{s.width:g}-t{s.twistiness:g}"
+        return f"random-s{s.seed}-c{s.corners}-l{s.length:g}-w{s.width:g}-t{s.twistiness:g}{cw}"
 
     def build(self):
         if self.kind == "classic":
-            return Track()
+            if not self.clockwise:
+                return Track()
+            # same layout driven the other way: keep the first point as the start
+            return Track(np.roll(np.asarray(CLASSIC_LAYOUT[::-1], float), 1, axis=0),
+                         name="Classic circuit (clockwise)")
         return generate_track(self.clamped())
 
     def to_args(self):
         """Command-line arguments that rebuild this spec (see add_track_args)."""
+        cw = ["--clockwise"] if self.clockwise else []
         if self.kind == "classic":
-            return ["--track", "classic"]
+            return ["--track", "classic"] + cw
         s = self.clamped()
         return ["--track", "random", "--seed", str(s.seed), "--corners", str(s.corners),
                 "--length", f"{s.length:g}", "--width", f"{s.width:g}",
-                "--twistiness", f"{s.twistiness:g}"]
+                "--twistiness", f"{s.twistiness:g}"] + cw
 
 
 def generate_track(spec, max_attempts=300):
@@ -237,7 +245,8 @@ def generate_track(spec, max_attempts=300):
     Build a random circuit from `spec`. Deterministic: the random generator
     is seeded with spec.seed, so the same spec gives the same track.
 
-    Recipe: control points around a circle (counter-clockwise), each with a
+    Recipe: control points around a circle (counter-clockwise, or reversed
+    for a clockwise track), each with a
     random angle and radius; more twistiness = radii vary more, so the
     layout gets more bends and hairpins. The result is stretched and
     rotated, scaled to the requested length, and rejected if a corner is
@@ -260,12 +269,15 @@ def generate_track(spec, max_attempts=300):
         pts = pts @ np.array([[c, -s], [s, c]]).T
 
         pts *= spec.length / closed_length(catmull_rom_closed(pts))
+        if spec.clockwise:
+            pts = pts[::-1].copy()
 
         # start on the longest straight-ish stretch between two control points
         gaps = np.linalg.norm(np.roll(pts, -1, axis=0) - pts, axis=1)
         pts = np.roll(pts, -int(np.argmax(gaps)), axis=0)
 
-        track = Track(pts, width=spec.width, name=f"Random #{spec.seed}")
+        name = f"Random #{spec.seed}" + (" (clockwise)" if spec.clockwise else "")
+        track = Track(pts, width=spec.width, name=name)
         if track.min_curve_radius() < half_w * 1.2 + 3:
             continue
         if track.min_clearance() < spec.width + 8:
@@ -273,6 +285,28 @@ def generate_track(spec, max_attempts=300):
         return track
     raise ValueError("Could not build a valid track with these settings. "
                      "Try another seed, fewer corners, a longer length or a narrower track.")
+
+
+# Settings the generalist driver is trained and validated on.
+GENERAL_RANGES = {"corners": (6, 16), "length": (1200.0, 3000.0),
+                  "width": (12.0, 18.0), "twistiness": (0.0, 0.8)}
+
+
+def sample_track(rng, ranges=GENERAL_RANGES):
+    """A random valid circuit with random settings (and direction). Returns (spec, track)."""
+    while True:
+        spec = TrackSpec(
+            kind="random", seed=int(rng.integers(0, 1_000_000_000)),
+            corners=int(rng.integers(ranges["corners"][0], ranges["corners"][1] + 1)),
+            length=float(round(rng.uniform(*ranges["length"]) / 100) * 100),
+            width=float(round(rng.uniform(*ranges["width"]))),
+            twistiness=float(round(rng.uniform(*ranges["twistiness"]) / 0.05) * 0.05),
+            clockwise=bool(rng.random() < 0.5),
+        ).clamped()
+        try:
+            return spec, spec.build()
+        except ValueError:
+            continue                                        # impossible settings: draw again
 
 
 # ---------------------------------------------------------- command line
@@ -285,11 +319,13 @@ def add_track_args(parser):
     g.add_argument("--length", type=float, default=d.length, help="metres")
     g.add_argument("--width", type=float, default=d.width, help="metres")
     g.add_argument("--twistiness", type=float, default=d.twistiness, help="0..1")
+    g.add_argument("--clockwise", action="store_true", help="drive the track the other way")
 
 
 def spec_from_args(args):
     return TrackSpec(kind=args.track, seed=args.seed, corners=args.corners,
-                     length=args.length, width=args.width, twistiness=args.twistiness)
+                     length=args.length, width=args.width, twistiness=args.twistiness,
+                     clockwise=args.clockwise)
 
 
 if __name__ == "__main__":
