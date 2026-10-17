@@ -1,13 +1,13 @@
 """
-Ambiente di simulazione: unisce circuito + macchina + sensori + ricompensa.
+Simulation environment: brings together track + car + sensors + reward.
 
-Interfaccia nello stile Gymnasium (lo standard del reinforcement learning):
+Gymnasium-style interface (the reinforcement learning standard):
 
     obs = env.reset()
     obs, reward, terminated, truncated, info = env.step([steer, throttle])
 
-Non contiene NESSUNA grafica: può girare migliaia di volte più veloce
-del tempo reale durante l'addestramento. Il renderer lo osserva soltanto.
+It contains NO graphics: it can run thousands of times faster than real
+time during training. The renderer only observes it.
 """
 import math
 
@@ -33,11 +33,11 @@ class CarCircuitEnv:
         self.crash_penalty = crash_penalty
         self.time_penalty = time_penalty
 
-        # angoli dei raggi relativi al muso: da -fov/2 (destra) a +fov/2 (sinistra)
+        # ray angles relative to the nose: from -fov/2 (right) to +fov/2 (left)
         half = math.radians(ray_fov_deg) / 2
         self.ray_angles = np.linspace(-half, half, n_rays)
 
-        # osservazione = distanze dei raggi (0..1) + velocità (0..1) + sterzo (-1..1)
+        # observation = ray distances (0..1) + speed (0..1) + steering (-1..1)
         self.obs_size = n_rays + 2
         self.action_size = 2
         self.reset()
@@ -47,7 +47,7 @@ class CarCircuitEnv:
         t = self.track
         self.car.reset(t.start_pos[0], t.start_pos[1], t.start_heading)
         self.seg, self.prev_s, self.lateral = t.closest(self.car.pos)
-        self.progress = 0.0          # metri percorsi in avanti (somma con segno)
+        self.progress = 0.0          # metres travelled forward (signed sum)
         self.best_progress = 0.0
         self.time = 0.0
         self.last_improve_time = 0.0
@@ -63,14 +63,14 @@ class CarCircuitEnv:
     # ------------------------------------------------------------------
     def step(self, action):
         if self.done:
-            raise RuntimeError("Episodio finito: chiama reset()")
+            raise RuntimeError("Episode finished: call reset()")
         steer, throttle = float(action[0]), float(action[1])
         h = self.dt / self.substeps
         for _ in range(self.substeps):
             self.car.step(steer, throttle, h)
         self.time += self.dt
 
-        # progresso lungo il circuito (gestisce il passaggio sul traguardo)
+        # progress along the track (handles crossing the finish line)
         t = self.track
         self.seg, s, self.lateral = t.closest(self.car.pos, hint=self.seg)
         ds = s - self.prev_s
@@ -81,11 +81,11 @@ class CarCircuitEnv:
         self.prev_s = s
         self.progress += ds
 
-        reward = ds / 10.0 - self.time_penalty      # +1 ogni 10 m in avanti
+        reward = ds / 10.0 - self.time_penalty      # +1 every 10 m forward
         terminated = truncated = False
         lap_completed = False
 
-        # giro completato?
+        # lap completed?
         if self.progress >= (self.laps + 1) * t.length:
             self.laps += 1
             self.last_lap_time = self.time - self.lap_start_time
@@ -95,14 +95,14 @@ class CarCircuitEnv:
             if self.laps >= self.laps_to_finish:
                 terminated = True
 
-        # collisione: un angolo della macchina fuori dai bordi
+        # collision: a corner of the car outside the edges
         self.crashed = any(abs(t.closest(c, hint=self.seg)[2]) > t.half_width
                            for c in self.car.corners())
         if self.crashed:
             reward -= self.crash_penalty
             terminated = True
 
-        # macchina ferma o che non avanza: tronca l'episodio
+        # car stopped or not making progress: truncate the episode
         if self.progress > self.best_progress + 0.5:
             self.best_progress = self.progress
             self.last_improve_time = self.time
@@ -117,7 +117,7 @@ class CarCircuitEnv:
             "laps": self.laps,
             "lap_time": self.last_lap_time,
             "current_lap_time": self.time - self.lap_start_time,
-            "progress": self.progress / t.length,     # in giri
+            "progress": self.progress / t.length,     # in laps
             "speed_kmh": self.car.speed * 3.6,
             "sliding": self.car.sliding,
             "time": self.time,

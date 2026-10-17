@@ -1,15 +1,15 @@
 """
-Fisica della macchina: modello "bicicletta" cinematico con limite di aderenza.
+Car physics: kinematic "bicycle" model with a grip limit.
 
-Comandi (entrambi tra -1 e +1):
-  steer    : +1 = tutto a sinistra, -1 = tutto a destra
-  throttle : +1 = acceleratore a fondo, -1 = freno a fondo
+Commands (both between -1 and +1):
+  steer    : +1 = full left, -1 = full right
+  throttle : +1 = full throttle, -1 = full brake
 
-L'idea chiave per la "traiettoria efficiente": le gomme hanno un limite
-di accelerazione laterale. Se entri in curva troppo veloce la macchina
-non riesce a girare quanto vorresti (sottosterzo) e va verso il muro.
-Quindi per essere veloci bisogna frenare prima delle curve e usare
-tutta la larghezza della pista: proprio quello che il modello dovrà imparare.
+The key idea behind the "efficient racing line": tyres have a limit on
+lateral acceleration. Enter a corner too fast and the car cannot turn as
+much as you ask (understeer), so it drifts towards the wall.
+To be fast you must brake before corners and use the whole width of the
+track: exactly what the model has to learn.
 """
 import math
 from dataclasses import dataclass
@@ -21,15 +21,15 @@ import numpy as np
 class CarParams:
     length: float = 4.5          # m
     width: float = 2.0           # m
-    wheelbase: float = 2.8       # m, distanza tra gli assi
+    wheelbase: float = 2.8       # m, distance between the axles
     max_speed: float = 70.0      # m/s (252 km/h)
-    engine_accel: float = 9.0    # m/s^2 a bassa velocità, cala verso max_speed
-    brake_decel: float = 16.0    # m/s^2 a freno pieno
-    rolling_decel: float = 0.6   # m/s^2, attrito quando non acceleri
-    max_steer: float = 0.5       # rad (~29°) angolo massimo delle ruote
-    steer_rate: float = 2.5      # rad/s, velocità con cui il volante si muove
-    max_lat_accel: float = 13.0  # m/s^2 (~1.3 g), limite di aderenza in curva
-    scrub_decel: float = 6.0     # m/s^2 persi quando le gomme slittano
+    engine_accel: float = 9.0    # m/s^2 at low speed, fades towards max_speed
+    brake_decel: float = 16.0    # m/s^2 at full brake
+    rolling_decel: float = 0.6   # m/s^2, drag when not accelerating
+    max_steer: float = 0.5       # rad (~29°) maximum wheel angle
+    steer_rate: float = 2.5      # rad/s, how fast the steering wheel turns
+    max_lat_accel: float = 13.0  # m/s^2 (~1.3 g), cornering grip limit
+    scrub_decel: float = 6.0     # m/s^2 lost while the tyres are sliding
 
 
 class Car:
@@ -39,10 +39,10 @@ class Car:
 
     def reset(self, x, y, heading, speed=0.0):
         self.x, self.y = float(x), float(y)
-        self.heading = float(heading)   # rad, 0 = verso +x, antiorario positivo
-        self.speed = float(speed)       # m/s, solo marcia avanti
-        self.steer = 0.0                # rad, angolo attuale delle ruote
-        self.sliding = False            # True se stiamo superando l'aderenza
+        self.heading = float(heading)   # rad, 0 = towards +x, counter-clockwise positive
+        self.speed = float(speed)       # m/s, forward only
+        self.steer = 0.0                # rad, current wheel angle
+        self.sliding = False            # True while exceeding the grip limit
 
     @property
     def pos(self):
@@ -53,19 +53,19 @@ class Car:
         steer_cmd = max(-1.0, min(1.0, float(steer_cmd)))
         throttle = max(-1.0, min(1.0, float(throttle)))
 
-        # sterzo: le ruote raggiungono l'angolo richiesto con velocità limitata
+        # steering: the wheels reach the requested angle at a limited rate
         target = steer_cmd * p.max_steer
         delta = max(-p.steer_rate * dt, min(p.steer_rate * dt, target - self.steer))
         self.steer += delta
 
-        # velocità longitudinale
+        # longitudinal speed
         if throttle >= 0:
             accel = throttle * p.engine_accel * (1.0 - self.speed / p.max_speed)
         else:
             accel = throttle * p.brake_decel
         accel -= p.rolling_decel
 
-        # rotazione: quanto vorremmo girare vs quanto le gomme permettono
+        # rotation: how much we would like to turn vs how much the tyres allow
         yaw_rate = self.speed / p.wheelbase * math.tan(self.steer)
         max_yaw = p.max_lat_accel / max(self.speed, 0.1)
         self.sliding = abs(yaw_rate) > max_yaw
@@ -79,7 +79,7 @@ class Car:
         self.y += self.speed * math.sin(self.heading) * dt
 
     def corners(self):
-        """I 4 angoli della carrozzeria (per collisioni e disegno)."""
+        """The 4 corners of the body (for collisions and drawing)."""
         c, s = math.cos(self.heading), math.sin(self.heading)
         hl, hw = self.p.length / 2, self.p.width / 2
         local = np.array([[hl, hw], [hl, -hw], [-hl, -hw], [-hl, hw]])

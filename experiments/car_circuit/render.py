@@ -1,25 +1,25 @@
 """
-Renderer pygame: vista dall'alto del circuito.
+Pygame renderer: top-down view of the circuit.
 
-È solo un osservatore: legge lo stato dell'ambiente e lo disegna.
-Non modifica mai la simulazione.
+It is only an observer: it reads the environment state and draws it.
+It never changes the simulation.
 
-Mostra:
-  - pista con cordoli e traguardo
-  - macchina e raggi dei sensori (verde = libero, rosso = muro vicino)
-  - la traiettoria del giro attuale e di quello precedente,
-    colorata per velocità (rosso = lento, verde = veloce)
-  - pannello con velocità, tempi sul giro, progresso, comandi
+Shows:
+  - the track with kerbs and finish line
+  - the car and its sensor rays (green = clear, red = wall close)
+  - the racing line of the current and previous lap,
+    coloured by speed (red = slow, green = fast)
+  - a panel with speed, lap times, progress and controls
 
-Tasti gestiti qui: C = cambia vista (la vista ravvicinata ruota con la macchina), V = mostra/nascondi sensori,
-R = riparti, ESC = esci.
+Keys handled here: C = switch view (the close-up view rotates with the car),
+V = sensors on/off, R = restart, ESC = quit.
 """
 import math
 
 import numpy as np
 import pygame
 
-# ---------------------------------------------------------------- colori
+# ---------------------------------------------------------------- colours
 GRASS_A = (54, 92, 52)
 GRASS_B = (58, 98, 55)
 ASPHALT = (58, 60, 66)
@@ -38,8 +38,9 @@ BAD = (255, 80, 70)
 GOOD = (90, 220, 120)
 
 PANEL_W = 300
-OVERVIEW_CAR_SCALE = 2.5     # nella vista d'insieme la macchina è ingrandita per vederla
-FOLLOW_SCALE = 6.0           # pixel per metro nella vista che segue la macchina
+OVERVIEW_CAR_SCALE = 2.5     # in the overview the car is enlarged so you can see it
+FOLLOW_SCALE = 6.0           # pixels per metre in the view that follows the car
+GRASS_STRIPE = 20.0          # metres, width of the grass stripes
 
 
 def fmt_time(t):
@@ -62,7 +63,7 @@ def speed_color(kmh, slow=40.0, fast=200.0):
 
 
 class Renderer:
-    def __init__(self, env, size=(1280, 820), title="MTAS - Auto su circuito"):
+    def __init__(self, env, size=(1280, 820), title="MTAS - Car on a circuit"):
         pygame.init()
         self.env = env
         self.track = env.track
@@ -86,23 +87,76 @@ class Renderer:
         self._last_laps = 0
         self._flash_text, self._flash_until = None, 0
 
-        # vista d'insieme: tutto il circuito nello spazio a destra del pannello
+        self._build_geometry()
+
+        # overview: the whole circuit in the space right of the panel
         lo, hi = self.track.bounds()
-        self.pad = 20.0                                    # metri di erba attorno
+        self.pad = 20.0                                    # metres of grass around it
         span = (hi - lo) + 2 * self.pad
         avail_w, avail_h = self.W - PANEL_W, self.H
         self.overview_scale = min(avail_w / span[0], avail_h / span[1])
         self.overview_center = (lo + hi) / 2
-        self.bg_origin = np.array([lo[0] - self.pad, hi[1] + self.pad])  # angolo alto-sinistra
-        self.bg_overview = self._render_track(self.overview_scale, span)
-        self.bg_follow = self._render_track(FOLLOW_SCALE, span)
+        self.bg_origin = np.array([lo[0] - self.pad, hi[1] + self.pad])  # top-left corner
+        self.bg_overview = self._render_overview(span)
 
-    # ================================================================ vista
+    # ======================================================== track shapes
+    def _build_geometry(self):
+        """Every piece of the track as a small polygon, computed once."""
+        t = self.track
+        L, R, N, n = t.left, t.right, t.N, t.normal
+        j = np.roll(np.arange(N), -1)
+        self.q_asphalt = np.stack([L, L[j], R[j], R], axis=1)            # (N, 4, 2)
+
+        kerb = 1.0                                                       # 1 m wide, inside the edges
+        Li, Ri = L - n * kerb, R + n * kerb
+        self.q_kerb = np.concatenate([np.stack([L, L[j], Li[j], Li], axis=1),
+                                      np.stack([R, R[j], Ri[j], Ri], axis=1)])
+        self.kerb_seg = np.concatenate([np.arange(N), np.arange(N)])     # which segment each kerb is on
+        self.kerb_col = [KERB_RED if (i // 3) % 2 == 0 else KERB_WHITE for i in self.kerb_seg]
+
+        dash = np.arange(0, N, 6)                                        # dashed centre line
+        self.dash = np.stack([t.center[dash], t.center[(dash + 3) % N]], axis=1)
+        self.dash_seg = dash
+
+        # chequered finish line
+        c0, n0, d0 = t.center[0], t.normal[0], t.tangent[0]
+        cells = 8
+        size = t.width / cells
+        quads, cols = [], []
+        for row in range(2):
+            for k in range(cells):
+                base = c0 - n0 * t.half_width + n0 * (k * size) + d0 * (row * size)
+                quads.append([base, base + n0 * size, base + n0 * size + d0 * size, base + d0 * size])
+                cols.append((240, 240, 240) if (k + row) % 2 == 0 else (25, 25, 25))
+        self.q_finish, self.finish_col = np.array(quads), cols
+
+    def _draw_shapes(self, surf, to_screen, seg_mask, line_w):
+        """Draw the track pieces whose segment is in `seg_mask` (bool array, len N)."""
+        def polys(q, idx):
+            if len(idx) == 0:
+                return []
+            pts = to_screen(q[idx].reshape(-1, 2))
+            return np.asarray(pts).reshape(len(idx), -1, 2).tolist()
+
+        idx = np.nonzero(seg_mask)[0]
+        for p in polys(self.q_asphalt, idx):
+            pygame.draw.polygon(surf, ASPHALT, p)
+        didx = np.nonzero(seg_mask[self.dash_seg])[0]
+        for a, b in polys(self.dash, didx):
+            pygame.draw.line(surf, ASPHALT_LINE, a, b, line_w)
+        kidx = np.nonzero(seg_mask[self.kerb_seg])[0]
+        for k, p in zip(kidx, polys(self.q_kerb, kidx)):
+            pygame.draw.polygon(surf, self.kerb_col[k], p)
+        if seg_mask[0] or seg_mask[-1]:
+            for col, p in zip(self.finish_col, polys(self.q_finish, np.arange(len(self.q_finish)))):
+                pygame.draw.polygon(surf, col, p)
+
+    # ================================================================ view
     def _view(self):
-        """Ritorna (scala, centro nel mondo, centro sullo schermo, angolo di rotazione).
+        """Return (scale, world centre, screen centre, rotation angle).
 
-        Nella vista che segue la macchina il mondo ruota in modo che il muso
-        punti sempre verso l'alto dello schermo.
+        In the view that follows the car the world rotates so that the nose
+        always points to the top of the screen.
         """
         sc = (PANEL_W + (self.W - PANEL_W) / 2, self.H / 2)
         if self.follow:
@@ -123,67 +177,46 @@ class Renderer:
         y = sc[1] - dy * s
         return list(zip(x.tolist(), y.tolist()))
 
-    def _blit_follow_bg(self):
-        """Ritaglia la pista attorno alla macchina, la ruota e la centra sullo schermo."""
-        s, c, sc, a = self._view_cache
-        view_w, view_h = self.W - PANEL_W, self.H
-        side = int(math.hypot(view_w, view_h)) + 4          # copre la vista a qualsiasi angolo
-        px = (c[0] - self.bg_origin[0]) * s
-        py = (self.bg_origin[1] - c[1]) * s
-        crop = pygame.Surface((side, side))
-        crop.fill(GRASS_A)
-        crop.blit(self.bg_follow, (0, 0), pygame.Rect(int(px - side / 2), int(py - side / 2), side, side))
-        rot = pygame.transform.rotate(crop, math.degrees(a))
-        self.screen.blit(rot, rot.get_rect(center=(int(sc[0]), int(sc[1]))))
-
-    # ======================================================== sfondo pista
-    def _render_track(self, scale, span):
-        """Disegna la pista una volta sola su una superficie (veloce da copiare ogni frame)."""
-        t = self.track
+    # ====================================================== track drawing
+    def _render_overview(self, span):
+        """Draw the whole track once onto a surface (fast to copy every frame)."""
+        scale = self.overview_scale
         w, h = int(span[0] * scale) + 2, int(span[1] * scale) + 2
         surf = pygame.Surface((w, h))
         surf.fill(GRASS_A)
-        stripe = max(8, int(20 * scale))
+        stripe = max(8, int(GRASS_STRIPE * scale))
         for i in range(0, w, stripe * 2):
             pygame.draw.rect(surf, GRASS_B, (i, 0, stripe, h))
 
-        def m(p):
-            return ((p[0] - self.bg_origin[0]) * scale, (self.bg_origin[1] - p[1]) * scale)
+        o = self.bg_origin
 
-        L, R, N = t.left, t.right, t.N
-        for i in range(N):
-            j = (i + 1) % N
-            pygame.draw.polygon(surf, ASPHALT, [m(L[i]), m(L[j]), m(R[j]), m(R[i])])
+        def to_bitmap(p):
+            return np.stack([(p[:, 0] - o[0]) * scale, (o[1] - p[:, 1]) * scale], axis=1)
 
-        # linea centrale tratteggiata (solo riferimento visivo)
-        for i in range(0, N, 6):
-            j = (i + 3) % N
-            pygame.draw.line(surf, ASPHALT_LINE, m(t.center[i]), m(t.center[j]), max(1, int(0.25 * scale)))
-
-        # cordoli bianchi/rossi lungo i bordi (larghi 1 m, verso l'interno)
-        kerb = 1.0
-        Li, Ri = L - t.normal * kerb, R + t.normal * kerb
-        for i in range(N):
-            j = (i + 1) % N
-            col = KERB_RED if (i // 3) % 2 == 0 else KERB_WHITE
-            pygame.draw.polygon(surf, col, [m(L[i]), m(L[j]), m(Li[j]), m(Li[i])])
-            pygame.draw.polygon(surf, col, [m(R[i]), m(R[j]), m(Ri[j]), m(Ri[i])])
-
-        # traguardo a scacchi
-        c0, n0, d0 = t.center[0], t.normal[0], t.tangent[0]
-        cells = 8
-        size = t.width / cells
-        for row in range(2):
-            for k in range(cells):
-                base = c0 - n0 * t.half_width + n0 * (k * size) + d0 * (row * size)
-                quad = [base, base + n0 * size, base + n0 * size + d0 * size, base + d0 * size]
-                col = (240, 240, 240) if (k + row) % 2 == 0 else (25, 25, 25)
-                pygame.draw.polygon(surf, col, [m(q) for q in quad])
+        self._draw_shapes(surf, to_bitmap, np.ones(self.track.N, bool), max(1, int(0.25 * scale)))
         return surf
 
-    # ============================================================== eventi
+    def _draw_follow_track(self):
+        """Close-up view: draw only the nearby track pieces, rotated with the car."""
+        s, c, _, _ = self._view_cache
+        radius = math.hypot(self.W - PANEL_W, self.H) / 2 / s + 2      # metres visible from the centre
+
+        # grass stripes fixed to the ground: they make speed visible
+        k0 = math.floor((c[0] - radius) / GRASS_STRIPE)
+        k1 = math.ceil((c[0] + radius) / GRASS_STRIPE)
+        y0, y1 = c[1] - radius, c[1] + radius
+        for k in range(k0, k1):
+            if k % 2:
+                x0, x1 = k * GRASS_STRIPE, (k + 1) * GRASS_STRIPE
+                pygame.draw.polygon(self.screen, GRASS_B, self.w2s_many([(x0, y0), (x1, y0), (x1, y1), (x0, y1)]))
+
+        t = self.track
+        near = ((t.center - c) ** 2).sum(axis=1) < (radius + t.width + 10) ** 2
+        self._draw_shapes(self.screen, self.w2s_many, near, max(1, int(round(0.25 * s))))
+
+    # ============================================================== events
     def handle_events(self):
-        """Ritorna False se l'utente vuole chiudere la finestra."""
+        """Return False if the user wants to close the window."""
         for e in pygame.event.get():
             if e.type == pygame.QUIT:
                 return False
@@ -204,15 +237,15 @@ class Renderer:
     def close(self):
         pygame.quit()
 
-    # ============================================================ disegno
+    # ============================================================ drawing
     def _update_history(self):
         env = self.env
-        if env.time < self._last_time:            # l'ambiente è stato resettato
+        if env.time < self._last_time:            # the environment was reset
             self.trail = []
             self._last_laps = 0
         self._last_time = env.time
 
-        if env.laps > self._last_laps:            # giro completato
+        if env.laps > self._last_laps:            # lap completed
             self._last_laps = env.laps
             lap = env.last_lap_time
             record = self.best_lap is None or lap < self.best_lap
@@ -220,7 +253,7 @@ class Renderer:
                 self.best_lap = lap
             self.prev_trail = self.trail
             self.trail = []
-            self._flash_text = ("RECORD! " if record else "GIRO ") + fmt_time(lap)
+            self._flash_text = ("RECORD! " if record else "LAP ") + fmt_time(lap)
             self._flash_until = pygame.time.get_ticks() + 2500
 
         pos = env.car.pos
@@ -234,7 +267,7 @@ class Renderer:
 
         self.screen.fill(GRASS_A)
         if self.follow:
-            self._blit_follow_bg()
+            self._draw_follow_track()
         else:
             self.screen.blit(self.bg_overview, self.w2s(self.bg_origin))
 
@@ -266,13 +299,13 @@ class Renderer:
         corners = car.pos + (car.corners() - car.pos) * k
         body = CAR_CRASH if self.env.crashed else CAR_BODY
         pygame.draw.polygon(self.screen, body, self.w2s_many(corners))
-        # parabrezza: indica il muso
+        # windscreen: shows where the nose is
         fl, fr, rr, rl = corners
         glass = [fl + (rl - fl) * 0.18, fr + (rr - fr) * 0.18, fr + (rr - fr) * 0.38, fl + (rl - fl) * 0.38]
         glass = [g + (fr - fl) * (0.12 if i in (0, 3) else -0.12) for i, g in enumerate(glass)]
         pygame.draw.polygon(self.screen, CAR_GLASS, self.w2s_many(glass))
 
-    # -------------------------------------------------------------- pannello
+    # ---------------------------------------------------------------- panel
     def _text(self, txt, x, y, font=None, color=TEXT):
         surf = (font or self.font).render(txt, True, color)
         self.screen.blit(surf, (x, y))
@@ -303,10 +336,10 @@ class Renderer:
         y += 26
 
         rows = [
-            ("Giro", f"{env.laps + 1}"),
-            ("Tempo giro", fmt_time(env.time - env.lap_start_time)),
-            ("Ultimo giro", fmt_time(env.last_lap_time)),
-            ("Miglior giro", fmt_time(self.best_lap)),
+            ("Lap", f"{env.laps + 1}"),
+            ("Lap time", fmt_time(env.time - env.lap_start_time)),
+            ("Last lap", fmt_time(env.last_lap_time)),
+            ("Best lap", fmt_time(self.best_lap)),
         ]
         for label, val in rows:
             self._text(label, x, y, self.font, TEXT_DIM)
@@ -315,34 +348,34 @@ class Renderer:
 
         y += 8
         lap_frac = (env.progress / self.track.length) - env.laps
-        self._text(f"Progresso giro  {max(0.0, lap_frac):5.1%}", x, y, self.font, TEXT_DIM)
+        self._text(f"Lap progress    {max(0.0, lap_frac):5.1%}", x, y, self.font, TEXT_DIM)
         y += 22
         self._bar(x, y, PANEL_W - 40, 8, lap_frac, ACCENT)
         y += 24
 
-        # comandi attuali
+        # current controls
         if action is not None:
             steer, thr = float(action[0]), float(action[1])
-            self._text("Acceleratore / freno", x, y, self.font_small, TEXT_DIM)
+            self._text("Throttle / brake", x, y, self.font_small, TEXT_DIM)
             y += 18
             self._bar(x, y, PANEL_W - 40, 10, thr, GOOD if thr >= 0 else BAD, centered=True)
             y += 22
-            self._text("Sterzo  (sx  <->  dx)", x, y, self.font_small, TEXT_DIM)
+            self._text("Steering  (L  <->  R)", x, y, self.font_small, TEXT_DIM)
             y += 18
             self._bar(x, y, PANEL_W - 40, 10, -car.steer / car.p.max_steer, ACCENT, centered=True)
             y += 24
 
         if car.sliding:
-            y += self._text("GOMME AL LIMITE!", x, y, self.font, WARN) + 4
+            y += self._text("TYRES AT THE LIMIT!", x, y, self.font, WARN) + 4
         if env.crashed:
-            y += self._text("INCIDENTE", x, y, self.font, BAD) + 4
+            y += self._text("CRASH", x, y, self.font, BAD) + 4
 
         for line in extra_lines or []:
             y += self._text(line, x, y, self.font_small, TEXT) + 4
 
-        # legenda comandi in basso
-        help_lines = ["Frecce / WASD  guida", "R  riparti", "C  cambia vista",
-                      "V  sensori on/off", "ESC  esci"]
+        # key help at the bottom
+        help_lines = ["Arrows / WASD  drive", "R  restart", "C  switch view",
+                      "V  sensors on/off", "ESC  quit"]
         yy = self.H - 20 - len(help_lines) * 19
         for line in help_lines:
             self._text(line, x, yy, self.font_small, TEXT_DIM)
@@ -351,8 +384,8 @@ class Renderer:
     def _draw_overlays(self):
         cx = PANEL_W + (self.W - PANEL_W) / 2
         if self.env.crashed:
-            self._center_text("INCIDENTE", cx, self.H / 2 - 30, BAD)
-            self._center_text("premi R per ripartire", cx, self.H / 2 + 30, TEXT, self.font)
+            self._center_text("CRASH", cx, self.H / 2 - 30, BAD)
+            self._center_text("press R to restart", cx, self.H / 2 + 30, TEXT, self.font)
         elif self._flash_text and pygame.time.get_ticks() < self._flash_until:
             self._center_text(self._flash_text, cx, 70, GOOD)
 

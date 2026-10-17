@@ -1,18 +1,22 @@
 """
-Guida tu la macchina con la tastiera.
+Drive the car yourself with the keyboard.
 
-    python play.py
+    python play.py                                  # classic circuit
+    python play.py --track random --seed 42         # a random circuit
 
-Frecce o WASD: su = accelera, giù = frena, sinistra/destra = sterza.
-R riparti, C cambia vista, V sensori on/off, ESC esci.
+Arrows or WASD: up = throttle, down = brake, left/right = steer.
+R restart, C switch view, V sensors on/off, ESC quit.
 
-Prova a fare un giro pulito: ti accorgerai che entrare in curva troppo
-veloce fa "scivolare" la macchina (scritta GOMME AL LIMITE) verso il muro.
+Try to drive a clean lap: you will notice that entering a corner too fast
+makes the car "slide" (TYRES AT THE LIMIT) towards the wall.
 """
+import argparse
+
 import pygame
 
 from env import CarCircuitEnv
 from render import Renderer
+from track import add_track_args, spec_from_args
 
 
 def keyboard_action():
@@ -27,8 +31,12 @@ def keyboard_action():
 
 
 def main():
-    # 60 passi al secondo in tempo reale; giri infiniti finché non sbatti
-    env = CarCircuitEnv(dt=1 / 60, substeps=1, laps_to_finish=10_000,
+    ap = argparse.ArgumentParser(description="Drive the car with the keyboard.")
+    add_track_args(ap)
+    track = spec_from_args(ap.parse_args()).build()
+
+    # 60 steps per second in real time; endless laps until you crash
+    env = CarCircuitEnv(track=track, dt=1 / 60, substeps=1, laps_to_finish=10_000,
                         max_time=1e9, stall_time=1e9)
     renderer = Renderer(env)
     env.reset()
