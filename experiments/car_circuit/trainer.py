@@ -144,18 +144,25 @@ class CpuBackend:
         self._send_all(("step", k))
         return self._gather()
 
-    def validate(self, genomes):
-        """Raw results [genome][circuit] on the validation circuits."""
-        jobs = [(gi, g, vi) for gi, g in enumerate(genomes) for vi in range(len(self.val_tracks))]
-        chunks = [jobs[i::len(self.conns)] for i in range(len(self.conns))]
-        busy = [(c, ch) for c, ch in zip(self.conns, chunks) if ch]
-        for c, ch in busy:
-            c.send(("eval", ch))
-        res = [[None] * len(self.val_tracks) for _ in genomes]
-        for c, _ in busy:
-            for gi, vi, r in c.recv():
-                res[gi][vi] = r
-        return res
+    def validation_start(self, genomes):
+        """Send one job (network, circuit) per message, spread over the workers."""
+        V = len(self.val_tracks)
+        jobs = [(gi, g, vi) for gi, g in enumerate(genomes) for vi in range(V)]
+        self._outstanding = [0] * len(self.conns)
+        for i, job in enumerate(jobs):
+            w = i % len(self.conns)
+            self.conns[w].send(("eval", [job]))
+            self._outstanding[w] += 1
+        return [[None] * V for _ in genomes]
+
+    def validation_poll(self, res, block=False):
+        """Collect the results that are ready (all of them if block). Returns True when complete."""
+        for w, c in enumerate(self.conns):
+            while self._outstanding[w] and (block or c.poll()):
+                for gi, vi, r in c.recv():
+                    res[gi][vi] = r
+                self._outstanding[w] -= 1
+        return not any(self._outstanding)
 
     def close(self):
         for c in self.conns:
@@ -204,11 +211,24 @@ class GpuBackend:
             self.sim.step(k)
         return self.sim.snapshot()
 
-    def validate(self, genomes):
+    def validation_start(self, genomes):
         from gpusim import BatchSim
-        sim = BatchSim(None, genomes, self.device, track_batch=self.val_tb)
-        sim.run_to_end()
-        return sim.results()
+        self.val_sim = BatchSim(None, genomes, self.device, track_batch=self.val_tb)
+        return [[None] * len(self.val_tracks) for _ in genomes]
+
+    def validation_poll(self, res, block=False):
+        sim = self.val_sim
+        if block:
+            sim.run_to_end()
+        else:
+            sim.step(150)
+        done = sim.done.cpu().numpy()
+        full = sim.results()
+        for gi, row in enumerate(full):
+            for vi, r in enumerate(row):
+                if done[gi, vi]:
+                    res[gi][vi] = r
+        return not sim.running()
 
     def close(self):
         self.sim = None
@@ -249,7 +269,9 @@ class LiveTrainer:
         self.record_lap = None
         self.record_gen = None
         self.record_val = None       # generalist: best validation summary so far
+        self.last_val = None         # generalist: result of the latest validation
         self.best_genome = None
+        self.validating = None       # generalist: the validation in progress, if any
         self.sim_time = 0.0          # simulated seconds in the current generation
         self.total_steps = 0
         self.started = time.perf_counter()
@@ -275,8 +297,11 @@ class LiveTrainer:
         self.state, self.obs = self.backend.start(self.pop)
 
     def advance(self, steps):
-        """Simulate `steps` more steps for every car still running."""
+        """Simulate `steps` more steps for every car still running (or advance the validation)."""
         if self.finished or steps <= 0:
+            return
+        if self.validating:
+            self._poll_validation(block=steps >= RUN_TO_END)
             return
         self.state, self.obs = self.backend.step(steps)
         self.sim_time += min(steps, RUN_TO_END) * self.env_dt
@@ -304,19 +329,56 @@ class LiveTrainer:
                 self.best_genome = self.pop[top].copy()
                 save_model(self.key, self.name, self.tracks[0].length, self.best_genome, lap_top, self.gen)
             entry.update(best_lap=lap_top, record_lap=self.record_lap)
-        elif self.gen % VALIDATE_EVERY == 0 or self.gen == self.generations:
+        elif self.validation_due(self.gen):
+            # the best networks now drive the validation circuits; the next generation waits
             cand = np.argsort(-fit)[:VALIDATE_TOP]
-            vals = [summarize(r, self.val_tracks) for r in self.backend.validate(self.pop[cand])]
-            # best = most unseen circuits completed; average score only breaks ties
-            rank = [(v["completed"], v["score"]) for v in vals]
-            b = int(max(range(len(vals)), key=lambda i: rank[i]))
-            entry.update(val_completed=vals[b]["completed"], val_speed=vals[b]["speed_kmh"])
-            if self.record_val is None or rank[b] > (self.record_val["completed"], self.record_val["score"]):
-                self.record_val, self.record_gen = vals[b], self.gen
-                self.best_genome = self.pop[cand[b]].copy()
-                save_model(self.key, self.name, 0.0, self.best_genome, None, self.gen, vals[b])
-        self.history.append(entry)
+            self.validating = {"entry": entry, "fit": fit, "cand": cand, "gen": self.gen,
+                               "res": self.backend.validation_start(self.pop[cand]),
+                               "started": time.perf_counter()}
+            return
+        self._complete_generation(entry, fit)
 
+    def validation_due(self, gen):
+        return self.general and (gen % VALIDATE_EVERY == 0 or gen == self.generations)
+
+    def _poll_validation(self, block=False):
+        v = self.validating
+        if not self.backend.validation_poll(v["res"], block):
+            return
+        cand, entry = v["cand"], v["entry"]
+        vals = [summarize(r, self.val_tracks) for r in v["res"]]
+        # best = most unseen circuits completed; average score only breaks ties
+        rank = [(x["completed"], x["score"]) for x in vals]
+        b = int(max(range(len(vals)), key=lambda i: rank[i]))
+        entry.update(val_completed=vals[b]["completed"], val_speed=vals[b]["speed_kmh"],
+                     val_crashed=vals[b]["crashed"], val_seconds=time.perf_counter() - v["started"])
+        self.last_val = dict(vals[b], gen=self.gen)
+        if self.record_val is None or rank[b] > (self.record_val["completed"], self.record_val["score"]):
+            self.record_val, self.record_gen = vals[b], self.gen
+            self.best_genome = self.pop[cand[b]].copy()
+            save_model(self.key, self.name, 0.0, self.best_genome, None, self.gen, vals[b])
+            self.last_val["new_record"] = True
+        self.validating = None
+        self._complete_generation(entry, v["fit"])
+
+    def validation_progress(self):
+        """Live view of the validation in progress: per network and in total."""
+        v = self.validating
+        if not v:
+            return None
+        nets = []
+        for row in v["res"]:
+            done = [r for r in row if r is not None]
+            nets.append({"completed": sum(1 for r in done if r[1]), "crashed": sum(1 for r in done if r[2]),
+                         "stalled": sum(1 for r in done if not r[1] and not r[2]),
+                         "running": len(row) - len(done)})
+        total = len(v["res"]) * len(self.val_tracks)
+        finished = total - sum(n["running"] for n in nets)
+        return {"gen": v["gen"], "nets": nets, "circuits": len(self.val_tracks), "finished": finished,
+                "total": total, "seconds": time.perf_counter() - v["started"]}
+
+    def _complete_generation(self, entry, fit):
+        self.history.append(entry)
         if self.gen >= self.generations:
             self.finished = True
             return

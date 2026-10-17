@@ -31,8 +31,11 @@ Everything happens in one window:
    - **PLAY** — drive it yourself;
    - **NEUROEVOLUTION** — train neural networks, live, in one of two modes:
      - *This track*: every network drives the circuit set up here;
-     - *Generalist*: every generation brings new random circuits (6, 8 or 10), so the networks have
-       to learn to drive instead of memorising a layout.
+     - *Generalist*: every generation brings new random circuits (from 1 to 36, you choose), so the
+       networks have to learn to drive instead of memorising a layout.
+
+   Compute: GPU or CPU; on the CPU you also choose how many worker processes (1 up to the number of
+   logical processors: more would only take turns on the same cores and use more memory).
 
    The *Trained models* box lets you run any saved model on the track currently set up, also one it
    has never seen, to check whether it learned to *drive* or only memorised its own circuit.
@@ -42,9 +45,9 @@ Everything happens in one window:
    (blue = running, grey = stopped, dark red = crashed; the leader is highlighted with its sensors).
    On the right: the leader's neural network (weights as coloured lines, neurons lit by their live
    activation) and a chart of the progress per generation. Speed 1x / 4x / 16x / Max, pause, stop.
-   In *Generalist* mode the map becomes an N×N grid: one circuit large with the whole population,
-   the others small with only the leader's car and the best lap of the generation (click one to
-   enlarge it).
+   In *Generalist* mode the map becomes a square grid with one tile per circuit, each tagged **#n**:
+   running cars as dots, the leader's car and the best lap of the generation. Click a circuit to open
+   it full screen with the whole population (**Esc** goes back to the grid).
    When training ends you can watch the best model or try it on another track.
 
 Keys: **C** overview / close-up view that rotates with the car · **V** sensors on/off · **R** restart ·
