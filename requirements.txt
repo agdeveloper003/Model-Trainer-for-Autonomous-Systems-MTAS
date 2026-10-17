@@ -1,0 +1,4 @@
+numpy>=1.24
+pygame>=2.5
+# se pygame non si installa sulla tua versione di Python, usa al suo posto:
+# pygame-ce>=2.5
