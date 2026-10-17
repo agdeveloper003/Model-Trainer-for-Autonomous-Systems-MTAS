@@ -49,7 +49,9 @@ ELITE = 6
 SIGMA = 0.08
 SPEED_REF = 70.0                  # m/s, the car's top speed: scales the speed bonus
 VALIDATION_SEED = 20251017        # fixed: the validation circuits never change
-VALIDATION_SIZE = 12              # random circuits, plus the classic one
+VALIDATION_SIZE = 13              # default: 12 random circuits + the classic one
+VALIDATE_EVERY = 5                # default: generations between two validations
+MAX_VALIDATION = 40
 
 
 # ============================================================ neural network
@@ -126,16 +128,23 @@ def next_generation(pop, fit, rng, elite=ELITE, sigma=SIGMA):
 
 
 # ============================================================ validation
-_validation = None
+_val_random = []        # the fixed sequence of random validation circuits, built as far as needed
+_val_rng = None
 
 
-def validation_tracks():
-    """Fixed circuits never used for training (same settings ranges, both directions)."""
-    global _validation
-    if _validation is None:
-        rng = np.random.default_rng(VALIDATION_SEED)
-        _validation = [sample_track(rng, GENERAL_RANGES)[1] for _ in range(VALIDATION_SIZE)] + [Track()]
-    return _validation
+def validation_tracks(n=VALIDATION_SIZE):
+    """
+    n fixed circuits never used for training: the first n-1 of a fixed sequence of random
+    circuits (same settings ranges as training, both directions) + the classic circuit.
+    Sets of different sizes are nested (13 contains the 12 of size 12...), so results stay comparable.
+    """
+    global _val_rng
+    n = max(1, min(int(n), MAX_VALIDATION))
+    if _val_rng is None:
+        _val_rng = np.random.default_rng(VALIDATION_SEED)
+    while len(_val_random) < n - 1:
+        _val_random.append(sample_track(_val_rng, GENERAL_RANGES)[1])
+    return _val_random[:n - 1] + [Track()]
 
 
 def run_episode(genome, track):
@@ -157,6 +166,7 @@ def summarize(results, tracks):
         "completed": sum(1 for r in results if r[1]) / len(results),
         "crashed": sum(1 for r in results if r[2]) / len(results),
         "speed_kmh": float(np.mean(done) * 3.6) if done else None,
+        "n": len(results),
     }
 
 
@@ -173,24 +183,57 @@ def save_model(key, track_name, track_length, genome, lap_time, generations, val
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     extra = {}
     if val:
-        extra = {"val_completed": val["completed"], "val_speed": val["speed_kmh"] or 0.0}
+        extra = {"val_completed": val["completed"], "val_speed": val["speed_kmh"] or 0.0,
+                 "val_circuits": val.get("n", 0)}
     np.savez(model_path(key), genome=genome, hidden=HIDDEN, lap_time=lap_time or -1.0,
-             generations=generations, track_name=track_name, track_length=track_length, **extra)
+             generations=generations, track_name=track_name, track_length=track_length,
+             track_id=key, general=key.startswith("general"), **extra)
 
 
 def _read(path):
-    data = np.load(path)
-    key = os.path.basename(path)[len("neuroevo_"):-len(".npz")]
-    return {
-        "path": path, "track_id": key, "general": key.startswith("general"),
-        "genome": data["genome"], "hidden": int(data["hidden"]),
-        "lap_time": float(data["lap_time"]),
-        "generations": int(data["generations"]) if "generations" in data else 0,
-        "track_name": str(data["track_name"]) if "track_name" in data else key,
-        "track_length": float(data["track_length"]) if "track_length" in data else 0.0,
-        "val_completed": float(data["val_completed"]) if "val_completed" in data else None,
-        "val_speed": float(data["val_speed"]) if "val_speed" in data else None,
-    }
+    """A saved model as a dict. Autosaves are neuroevo_<id>.npz, models saved by name model_<name>.npz."""
+    with np.load(path) as data:
+        base = os.path.basename(path)[:-len(".npz")]
+        key = base[len("neuroevo_"):] if base.startswith("neuroevo_") else base
+        track_id = str(data["track_id"]) if "track_id" in data else key
+        return {
+            "path": path, "track_id": track_id,
+            "general": bool(data["general"]) if "general" in data else track_id.startswith("general"),
+            "name": str(data["name"]) if "name" in data else None,        # set only for models saved by name
+            "genome": np.array(data["genome"]), "hidden": int(data["hidden"]),
+            "lap_time": float(data["lap_time"]),
+            "generations": int(data["generations"]) if "generations" in data else 0,
+            "track_name": str(data["track_name"]) if "track_name" in data else key,
+            "track_length": float(data["track_length"]) if "track_length" in data else 0.0,
+            "val_completed": float(data["val_completed"]) if "val_completed" in data else None,
+            "val_circuits": int(data["val_circuits"]) if "val_circuits" in data else VALIDATION_SIZE,
+            "val_speed": float(data["val_speed"]) if "val_speed" in data else None,
+        }
+
+
+def named_path(name):
+    """File of a model saved by name: letters, digits, - and _ only."""
+    slug = "".join(c if c.isalnum() or c in "-_" else "_" for c in name.strip())[:48].strip("_")
+    return os.path.join(CHECKPOINT_DIR, f"model_{slug or 'unnamed'}.npz")
+
+
+def save_named(source_path, name):
+    """Copy a saved model to its own file under a name chosen by the user. Returns the new path."""
+    with np.load(source_path) as data:
+        content = {k: data[k] for k in data.files}
+    content["name"] = np.array(name.strip())
+    path = named_path(name)
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    np.savez(path, **content)
+    return path
+
+
+def delete_model(path):
+    """Delete a saved model file (only .npz files inside checkpoints/)."""
+    path = os.path.abspath(path)
+    if os.path.dirname(path) != os.path.abspath(CHECKPOINT_DIR) or not path.endswith(".npz"):
+        raise ValueError(f"not a model file: {path}")
+    os.remove(path)
 
 
 def load_model(path):
@@ -204,9 +247,15 @@ def load_checkpoint(spec):
 
 def list_models():
     """Every saved model, most recent first."""
-    paths = sorted(glob.glob(os.path.join(CHECKPOINT_DIR, "neuroevo_*.npz")),
-                   key=os.path.getmtime, reverse=True)
-    return [_read(p) for p in paths]
+    paths = glob.glob(os.path.join(CHECKPOINT_DIR, "neuroevo_*.npz"))
+    paths += glob.glob(os.path.join(CHECKPOINT_DIR, "model_*.npz"))
+    models = []
+    for p in sorted(paths, key=os.path.getmtime, reverse=True):
+        try:
+            models.append(_read(p))
+        except Exception:                       # unreadable or half-written file: skip it
+            pass
+    return models
 
 
 # ============================================================ command line
@@ -222,12 +271,16 @@ def main():
                     help="cpu = one worker process per core, gpu = every car at once on the graphics card")
     ap.add_argument("--workers", type=int, default=None, help="parallel processes (cpu)")
     ap.add_argument("--evo-seed", type=int, default=0, help="seed of the evolution itself")
+    ap.add_argument("--val-every", type=int, default=VALIDATE_EVERY,
+                    help="generalist: validate every N generations")
+    ap.add_argument("--val-circuits", type=int, default=VALIDATION_SIZE,
+                    help=f"generalist: validation circuits (1..{MAX_VALIDATION}; the last one is the classic)")
     add_track_args(ap)
     args = ap.parse_args()
 
     if args.general:
         tr = LiveTrainer(args.generations, args.pop, args.workers, args.evo_seed, n_tracks=args.tracks,
-                         device=args.device)
+                         device=args.device, validate_every=args.val_every, val_circuits=args.val_circuits)
     else:
         spec = spec_from_args(args)
         tr = LiveTrainer(args.generations, args.pop, args.workers, args.evo_seed, spec=spec,

@@ -80,8 +80,16 @@ def bar(surf, x, y, w, h, frac, color, centered=False):
 
 
 def wrap(txt, font, width):
-    """Split `txt` into lines that fit `width` pixels."""
-    words, lines, cur = txt.split(), [], ""
+    """Split `txt` into lines that fit `width` pixels (words too long for a line are cut)."""
+    words, lines, cur = [], [], ""
+    for w in txt.split():
+        while font.size(w)[0] > width and len(w) > 1:     # e.g. a long file name without spaces
+            n = len(w)
+            while n > 1 and font.size(w[:n])[0] > width:
+                n -= 1
+            words.append(w[:n])
+            w = w[n:]
+        words.append(w)
     for w in words:
         trial = (cur + " " + w).strip()
         if font.size(trial)[0] <= width or not cur:
@@ -211,6 +219,7 @@ class Slider(Widget):
 
 class NumberField(Widget):
     """Click to type a whole number (e.g. the seed)."""
+    digits = True
 
     def __init__(self, label, value, max_len=9, on_change=None):
         super().__init__()
@@ -221,20 +230,27 @@ class NumberField(Widget):
         if not self.active():
             return False
         if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
-            was = self.focused
+            # a click elsewhere just closes the field: the click still reaches what it was meant for
             self.focused = self.rect.collidepoint(e.pos)
-            return self.focused or was
+            return self.focused
         if e.type == pygame.KEYDOWN and self.focused:
             if e.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_ESCAPE, pygame.K_TAB):
                 self.focused = False
             elif e.key == pygame.K_BACKSPACE:
                 self.value = self.value[:-1]
                 self._changed()
-            elif e.unicode.isdigit() and len(self.value) < self.max_len:
-                self.value = (self.value + e.unicode).lstrip("0") or "0"
+            elif self._accepts(e.unicode) and len(self.value) < self.max_len:
+                self.value += e.unicode
+                if self.digits:
+                    self.value = self.value.lstrip("0") or "0"
                 self._changed()
             return True
         return False
+
+    def _accepts(self, ch):
+        if not ch:
+            return False
+        return ch.isdigit() if self.digits else (ch.isprintable() and ch not in '\\/:*?"<>|')
 
     def _changed(self):
         if self.on_change:
@@ -255,6 +271,14 @@ class NumberField(Widget):
         v = text(surf, self.value or " ", (r.right + 10, self.rect.centery), f.bold, col, "midleft")
         if self.focused and (pygame.time.get_ticks() // 500) % 2 == 0:
             pygame.draw.line(surf, ACCENT, (v.right + 2, v.top + 2), (v.right + 2, v.bottom - 2), 2)
+
+
+class TextField(NumberField):
+    """Click to type a short text (e.g. a model name)."""
+    digits = False
+
+    def __init__(self, label, value="", max_len=32, on_change=None):
+        super().__init__(label, value, max_len, on_change)
 
 
 class Segmented(Widget):

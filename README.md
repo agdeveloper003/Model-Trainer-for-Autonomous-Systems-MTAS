@@ -48,7 +48,10 @@ Everything happens in one window:
    In *Generalist* mode the map becomes a square grid with one tile per circuit, each tagged **#n**:
    running cars as dots, the leader's car and the best lap of the generation. Click a circuit to open
    it full screen with the whole population (**Esc** goes back to the grid).
-   When training ends you can watch the best model or try it on another track.
+   When training ends (or you stop it) you can watch the best model, try it on another track, or
+   **save it with a name** (`checkpoints/model_<name>.npz`), so that later trainings never overwrite it.
+   In the setup screen the *Trained models* box lists every model; **Delete** removes one (click twice
+   to confirm).
 
 Keys: **C** overview / close-up view that rotates with the car · **V** sensors on/off · **R** restart ·
 **Space** pause training · **Esc** back to the menu.
@@ -59,6 +62,7 @@ Keys: **C** overview / close-up view that rotates with the car · **V** sensors 
 python neuroevo.py --track random --seed 42      # headless training on one track (same results as the app)
 python neuroevo.py --general --tracks 8          # headless generalist training
 python neuroevo.py --general --device gpu        # ... with the simulation on the GPU
+python neuroevo.py --general --val-every 10 --val-circuits 25   # ... validating less often, on more circuits
 python benchmark.py                              # every saved model on the validation circuits
 python bot.py --track random --seed 42           # rule-based driver: prints a reference lap time
 python track.py --track random --seed 42         # print the stats of a track
@@ -113,11 +117,17 @@ circuit's length, so scores of different circuits can be averaged.
 - **This track:** fitness = score on that circuit. The best network survives unchanged and the circuit
   never changes, so the best score can only stay equal or improve from one generation to the next.
 - **Generalist:** fitness = average score over K new random circuits (both directions) every generation.
-  Every 5 generations the 3 best networks drive the **validation circuits** — 12 random ones plus the
-  classic circuit, fixed and never used for training — and the model is saved only when it completes
-  more of them (ties: higher average score). This measures driving, not memory.
+  Every few generations the 3 best networks drive the **validation circuits** — fixed random circuits
+  never used for training, plus the classic circuit — and the model is saved only when it completes
+  more of them (ties: higher average score). This measures driving, not memory. How often (default
+  every 5 generations) and on how many circuits (default 13) is chosen in the *Validation* card:
+  validating more often catches good networks sooner but pauses training more; more circuits give a
+  fairer, less lucky measure but each check takes longer. Larger sets contain the smaller ones, so
+  results stay comparable.
 
-Models are saved in `checkpoints/neuroevo_<track id>.npz` (generalist: `neuroevo_general-k<K>.npz`);
+During training the best model is saved automatically in `checkpoints/neuroevo_<track id>.npz`
+(generalist: `neuroevo_general-k<K>.npz`; the next training with the same settings overwrites it, the
+setup screen warns about it); models saved by name go to `checkpoints/model_<name>.npz`;
 the command-line trainer also logs the progress in `runs/`.
 
 ### Compute: CPU or GPU

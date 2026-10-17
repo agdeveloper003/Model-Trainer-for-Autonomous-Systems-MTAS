@@ -207,7 +207,7 @@ VAL_COL = (240, 200, 90)             # left axis: unseen validation circuits com
 SPEED_COL = (90, 180, 255)           # right axis: average speed on the validation circuits
 
 
-def draw_chart_general(surf, rect, history, total_generations):
+def draw_chart_general(surf, rect, history, total_generations, every=5):
     """
     Generalist training, shared generation axis:
       bars (left %)     survival rate on the training circuits of each generation
@@ -249,4 +249,5 @@ def draw_chart_general(surf, rect, history, total_generations):
             pygame.draw.circle(surf, col, (int(p[0]), int(p[1])), 3)
     if not vals:
         text(surf, "validation on unseen circuits", (plot.centerx, plot.centery - 9), f.small, VAL_COL, "center")
-        text(surf, "every 5 generations", (plot.centerx, plot.centery + 9), f.small, VAL_COL, "center")
+        when = "every generation" if every == 1 else f"every {every} generations"
+        text(surf, when, (plot.centerx, plot.centery + 9), f.small, VAL_COL, "center")

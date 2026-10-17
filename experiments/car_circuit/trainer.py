@@ -30,14 +30,13 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-from neuroevo import (ELITE, SIGMA, Net, make_training_env, next_generation, random_population,
-                      run_episode, save_model, summarize, track_score, validation_tracks)
+from neuroevo import (ELITE, SIGMA, VALIDATE_EVERY, VALIDATION_SIZE, Net, make_training_env, next_generation,
+                      random_population, run_episode, save_model, summarize, track_score, validation_tracks)
 from track import GENERAL_RANGES, sample_track
 
 # columns of the per-car, per-circuit state array
 X, Y, HEADING, SPEED, DONE, CRASHED, PROGRESS, LAPS, LAP_TIME, SCORE = range(10)
 STATE_COLS = 10
-VALIDATE_EVERY = 5       # generations between two validation runs (generalist)
 VALIDATE_TOP = 3         # how many of the best networks are validated
 RUN_TO_END = 100_000     # advance(RUN_TO_END) = finish the generation without stopping
 
@@ -237,8 +236,10 @@ class GpuBackend:
 # =============================================================== trainer
 class LiveTrainer:
     def __init__(self, generations=150, pop_size=96, workers=None, seed=0,
-                 spec=None, track=None, n_tracks=None, device="cpu"):
+                 spec=None, track=None, n_tracks=None, device="cpu",
+                 validate_every=VALIDATE_EVERY, val_circuits=VALIDATION_SIZE):
         self.general = n_tracks is not None
+        self.validate_every = max(1, int(validate_every))
         self.n_tracks = n_tracks if self.general else 1
         self.generations, self.pop_size, self.seed = generations, pop_size, seed
         self.rng = np.random.default_rng(seed)
@@ -250,7 +251,7 @@ class LiveTrainer:
         if self.general:
             self.key = f"general-k{n_tracks}"
             self.name = f"Generalist ({n_tracks} tracks/gen)"
-            self.val_tracks = validation_tracks()
+            self.val_tracks = validation_tracks(val_circuits)
             self.backend.set_validation(self.val_tracks)
             # circuits of the next generation are built in the background while this one runs
             self._pool = ThreadPoolExecutor(max_workers=1)
@@ -339,7 +340,7 @@ class LiveTrainer:
         self._complete_generation(entry, fit)
 
     def validation_due(self, gen):
-        return self.general and (gen % VALIDATE_EVERY == 0 or gen == self.generations)
+        return self.general and (gen % self.validate_every == 0 or gen == self.generations)
 
     def _poll_validation(self, block=False):
         v = self.validating

@@ -23,12 +23,13 @@ import pygame
 
 from env import CarCircuitEnv
 from netviz import VAL_COL, NetworkView, draw_chart, draw_chart_general
-from neuroevo import Net, list_models, load_model, model_path
+from neuroevo import (ELITE, MAX_VALIDATION, VALIDATE_EVERY, VALIDATION_SIZE, Net, delete_model, list_models,
+                      load_model, model_path, named_path, save_named)
 from render import CAR_BODY, CAR_CRASH, FOLLOW_SCALE, TrackView, fmt_time, speed_color
 from track import TrackSpec
 from trainer import (CRASHED, DONE, HEADING, LAP_TIME, PROGRESS, SPEED, VALIDATE_TOP, X, Y, LiveTrainer,
                      gpu_available)
-from ui import (ACCENT, BAD, BG, BORDER, GOOD, PANEL, TEXT, TEXT_DIM, WARN, Button, Cycler,
+from ui import (ACCENT, BAD, BG, BORDER, GOOD, PANEL, TEXT, TEXT_DIM, WARN, Button, Cycler, TextField,
                 NumberField, Segmented, Slider, bar, card, fonts, text, wrap)
 
 TITLE = "MTAS - Model Trainer for Autonomous Systems"
@@ -132,23 +133,32 @@ class SetupScreen(Screen):
         self.compute = Segmented([("gpu", "GPU (CUDA)"), ("cpu", "CPU")], app.device, self._mode_changed)
         self.workers = Slider("CPU workers", 1, MAX_WORKERS, 1, app.workers, "{:.0f} processes",
                               self._mode_changed)
+        self.val_every = Slider("Validate every", 1, 50, 1, app.val_every, "{:.0f} generations",
+                                self._mode_changed)
+        self.val_n = Slider("Validation circuits", 1, MAX_VALIDATION, 1, app.val_circuits, "{:.0f}",
+                            self._mode_changed)
         self.gens = Slider("Generations", 10, 1000, 10, app.generations, "{:.0f}")
-        self.pop = Slider("Population", 16, 480, 16, app.population, "{:.0f} cars")
+        self.pop = Slider("Networks", 16, 480, 16, app.population, "{:.0f}")
 
         self.models = list_models()
         idx = next((i for i, m in enumerate(self.models) if m["path"] == app.model_path), 0)
         self.model = Cycler([(m["path"], self._model_label(m)) for m in self.models], idx, self._pick_model)
-        self.btn_model = Button("Run this model on the track", self._run_model, "primary")
+        self.btn_model = Button("Run on this track", self._run_model, "primary")
+        self.btn_delete = Button("Delete", self._delete_model)
+        self._delete_armed_until = 0                 # first click arms, second click (within 4 s) deletes
 
         self.widgets = [self.kind, self.seed, self.dice, self.corners, self.length, self.width, self.twist,
                         self.direction, self.btn_play, self.btn_train, self.mode, self.circuits, self.compute,
-                        self.workers, self.gens, self.pop, self.model, self.btn_model]
+                        self.workers, self.gens, self.pop, self.val_every, self.val_n, self.model, self.btn_model,
+                        self.btn_delete]
         self.track, self.error, self.view = None, None, None
         self._rebuild_at = 0.0
         self._rebuild()
 
     @staticmethod
     def _model_label(m):
+        if m["name"]:
+            return m["name"]
         if m["general"]:
             done = m["val_completed"]
             return f"Generalist  {done:.0%} unseen" if done is not None else "Generalist"
@@ -156,11 +166,14 @@ class SetupScreen(Screen):
         return f"{m['track_name']}  {lap}"
 
     def _mode_changed(self, *_):
+        if self.mode.value != self.app.train_mode and hasattr(self, "r_evo"):
+            self._size = None                                 # card sizes depend on the mode
         if self.mode.value != self.app.train_mode and self.app.has_torch:
             # the GPU pays off with many cars (generalist); one track with ~100 cars is faster on the CPU
             self.compute.value = "gpu" if self.mode.value == "general" else "cpu"
         self.app.train_mode, self.app.n_circuits = self.mode.value, int(self.circuits.value)
         self.app.device, self.app.workers = self.compute.value, int(self.workers.value)
+        self.app.val_every, self.app.val_circuits = int(self.val_every.value), int(self.val_n.value)
 
     # ---------------------------------------------------------- settings
     def _changed(self, *_):
@@ -204,6 +217,7 @@ class SetupScreen(Screen):
         cpu = self.compute.value == "cpu"
         if self.circuits.visible != general or self.workers.visible != cpu:
             self.circuits.visible, self.workers.visible = general, cpu
+            self.val_every.visible = self.val_n.visible = general
             if hasattr(self, "r_evo"):
                 self._place_evo()
         self.btn_play.enabled = ok
@@ -212,7 +226,10 @@ class SetupScreen(Screen):
         self.btn_train.sub = (f"generalist · {n} new circuit{'s' if n > 1 else ''} per generation"
                               if general else "train neural networks on this circuit, live")
         self.btn_model.enabled = ok and bool(self.models)
-        self.model.enabled = bool(self.models)
+        self.model.enabled = self.btn_delete.enabled = bool(self.models)
+        armed = pygame.time.get_ticks() < self._delete_armed_until
+        self.btn_delete.label = "Confirm?" if armed else "Delete"
+        self.btn_delete.kind = "primary" if armed else "normal"
         self.app.generations, self.app.population = int(self.gens.value), int(self.pop.value)
 
     # ----------------------------------------------------------- actions
@@ -224,6 +241,25 @@ class SetupScreen(Screen):
             self.app.go(TrainScreen(self.app, None, None, n_tracks=int(self.circuits.value)))
         else:
             self.app.go(TrainScreen(self.app, self.app.spec, self.track))
+
+    def _delete_model(self):
+        """First click arms the button, a second click within 4 seconds deletes the model file."""
+        if pygame.time.get_ticks() >= self._delete_armed_until:
+            self._delete_armed_until = pygame.time.get_ticks() + 4000
+            return
+        self._delete_armed_until = 0
+        path = self.model.value
+        if not path:
+            return
+        try:
+            delete_model(path)
+        except OSError:
+            return
+        if self.app.model_path == path:
+            self.app.model_path = None
+        self.models = list_models()
+        self.model.options = [(m["path"], self._model_label(m)) for m in self.models]
+        self.model.index = min(self.model.index, max(0, len(self.models) - 1))
 
     def _run_model(self):
         model = next((m for m in self.models if m["path"] == self.model.value), None)
@@ -267,32 +303,45 @@ class SetupScreen(Screen):
         y = self.r_track.bottom + 14
         self.r_models = pygame.Rect(self.r_left.x, y, self.r_left.w, self.btn_play.rect.y - 14 - y)
         self.model.rect = pygame.Rect(x, y + 40, cw, 38)
-        self.btn_model.rect = pygame.Rect(x, self.r_models.bottom - 54, cw, 40)
+        self.btn_model.rect = pygame.Rect(x, self.r_models.bottom - 54, cw - 110, 40)
+        self.btn_delete.rect = pygame.Rect(x + cw - 100, self.r_models.bottom - 54, 100, 40)
 
         # ---- right: neuroevolution settings, NEUROEVOLUTION
         x, cw = self.r_right.x, self.r_right.w
-        train_h = 90 if compact else 110
+        train_h = 80 if compact else 92
         self.btn_train.rect = pygame.Rect(x, bottom - train_h, cw, train_h)
-        self.r_evo = pygame.Rect(x, top, cw, self.btn_train.rect.y - 14 - top)
         self._place_evo()
 
     def _place_evo(self):
-        """Controls of the neuroevolution card; circuits only in generalist mode, workers only on CPU."""
-        x, cw, y = self.r_evo.x + 16, self.r_evo.w - 32, self.r_evo.y + 38
+        """
+        Right column, top to bottom: settings card (sized to its controls), validation card
+        (generalist only), simulation recap (all the space left above the NEUROEVOLUTION button).
+        """
+        rr = self.r_right
+        x, cw, y = rr.x + 16, rr.w - 32, rr.y + 38
         self.mode.rect = pygame.Rect(x, y, cw, 36)
-        y += 50
+        y += 46
         if self.circuits.visible:
             self.circuits.rect = pygame.Rect(x, y, cw, 42)
-            y += 56
+            y += 52
         self.compute.rect = pygame.Rect(x, y, cw, 36)
-        y += 50
+        y += 46
         if self.workers.visible:
             self.workers.rect = pygame.Rect(x, y, cw, 42)
-            y += 56
+            y += 52
         self.gens.rect = pygame.Rect(x, y, cw, 42)
-        y += 56
+        y += 52
         self.pop.rect = pygame.Rect(x, y, cw, 42)
-        self.evo_info_y = y + 64
+        self.r_evo = pygame.Rect(rr.x, rr.y, rr.w, y + 42 + 16 - rr.y)
+        y = self.r_evo.bottom + 14
+        if self.mode.value == "general":
+            self.r_val = pygame.Rect(rr.x, y, rr.w, 38 + 42 + 10 + 42 + 14)
+            self.val_every.rect = pygame.Rect(x, y + 38, cw, 42)
+            self.val_n.rect = pygame.Rect(x, y + 38 + 52, cw, 42)
+            y = self.r_val.bottom + 14
+        else:
+            self.r_val = None
+        self.r_recap = pygame.Rect(rr.x, y, rr.w, self.btn_train.rect.y - 14 - y)
 
         if self.view:
             self.view.set_rect(self.r_preview.inflate(-2, -2))
@@ -355,29 +404,80 @@ class SetupScreen(Screen):
                     text(surf, part, (x, y), f.small, ACCENT if hint else TEXT_DIM)
                 y += 18
 
-        # ---- neuroevolution settings card, with a short description of the chosen mode
+        # ---- right column: settings, validation, live recap of the simulation
         card(surf, self.r_evo, "Neuroevolution settings")
-        x, cw = self.r_evo.x + 16, self.r_evo.w - 32
-        if self.mode.value == "general":
-            n = int(self.circuits.value)
-            desc = [f"Every generation brings {n} new random circuit{'s' if n > 1 else ''} (both directions); "
-                    f"a network's "
-                    f"score is its average over them, so it has to learn to drive, not to memorise.",
-                    "Every 5 generations the best 3 drive 13 validation circuits they never train on: "
-                    "the saved model is the best one there."]
+        if self.r_val is not None:
+            card(surf, self.r_val, "Validation")
+        self._draw_recap(surf)
+
+    def _recap_rows(self):
+        """(label, text, colour) rows describing the training these settings will run."""
+        general = self.mode.value == "general"
+        P, G = int(self.pop.value), int(self.gens.value)
+        K = int(self.circuits.value) if general else 1
+        cars = P * K
+        rows = []
+        # where the model goes, first: overwriting an existing model must not go unnoticed
+        key = f"general-k{K}" if general else (self.app.spec.track_id() if self.track else None)
+        save_row = None
+        if key:
+            old = next((m for m in self.models if m["path"] == model_path(key)), None)    # the autosave only
+            if old:
+                if old["general"]:
+                    was = (f"{old['val_completed']:.0%} unseen done" if old["val_completed"] is not None
+                           else "not validated")
+                else:
+                    was = f"best lap {fmt_time(old['lap_time'])}" if old["lap_time"] > 0 else "no full lap"
+                save_row = ("Saved to", f"{key}.npz, OVERWRITES the existing model ({was}, "
+                                        f"{old['generations']} gen)", WARN)
+            else:
+                save_row = ("Saved to", f"{key}.npz (new)", TEXT)
+        if general:
+            rows.append(("Each gen", f"{P} networks x {K} new random circuit{'s' if K > 1 else ''} "
+                                     f"= {cars} cars", TEXT))
+            if save_row:
+                rows.append(save_row)
         else:
-            desc = ["Every network drives the circuit set up on the left. The model learns it very well, "
-                    "but may only know that one: try it on other circuits with Trained models."]
-        desc.append("GPU: every car at once on the graphics card, best with many cars (generalist). "
-                    if self.compute.value == "gpu" else
-                    "CPU: one worker process per core, best for one track (~100 cars).")
-        y = self.evo_info_y
-        for para in desc:
-            for part in wrap(para, f.small, cw):
-                if y < self.r_evo.bottom - 18:
-                    text(surf, part, (x, y), f.small, TEXT_DIM)
-                y += 18
-            y += 8
+            name = self.track.name if self.track else "no valid circuit"
+            rows.append(("Circuit", f"{name}, the same in every generation", TEXT))
+            rows.append(("Each gen", f"{P} networks = {P} cars", TEXT))
+            if save_row:
+                rows.append(save_row)
+        if self.compute.value == "gpu":
+            rows.append(("Compute", f"GPU, all {cars} cars at once", TEXT))
+        else:
+            w = min(int(self.workers.value), P)
+            per = math.ceil(P / w)
+            rows.append(("Compute", f"{w} CPU workers x up to {per} net{'s' if per > 1 else ''} "
+                                    f"({per * K} cars)", TEXT))
+        if general:
+            every, n_val = int(self.val_every.value), int(self.val_n.value)
+            checks = sum(1 for g in range(1, G + 1) if g % every == 0 or g == G)
+            rows.append(("Validation", f"{checks}x, every {every} gen: best {VALIDATE_TOP} on {n_val} unseen "
+                                       f"circuit{'s' if n_val > 1 else ''} ({VALIDATE_TOP * n_val} laps)", TEXT))
+        rows.append(("Evolution", f"{G} gen; top {ELITE} kept, rest bred from top 25% + mutation", TEXT))
+        return rows
+
+    def _draw_recap(self, surf):
+        """Live summary of what the training will do with the current settings."""
+        r = self.r_recap
+        if r.h < 70:
+            return
+        f = fonts()
+        card(surf, r, "Simulation recap")
+        x, y = r.x + 16, r.y + 36
+        lab_w = 92
+        val_w = r.w - 32 - lab_w
+        for label, value, col in self._recap_rows():
+            lines = wrap(value, f.small, val_w)
+            if y + 17 * len(lines) > r.bottom - 8:
+                text(surf, "...", (x, y), f.small, TEXT_DIM)
+                break
+            text(surf, label, (x, y), f.small, WARN if col == WARN else TEXT_DIM)
+            for line in lines:
+                text(surf, line, (x + lab_w, y), f.small, col)
+                y += 17
+            y += 5
 
     def _draw_direction(self, surf):
         """Arrow along the first metres of the track: the driving direction."""
@@ -599,7 +699,11 @@ class TrainScreen(Screen):
         self.btn_watch = Button("Watch best model", self._watch, "primary")
         self.btn_other = Button("Try another track", self._other, "primary")
         self.btn_back = Button("< Menu", self._back)
-        self.widgets = [self.speed, self.btn_pause, self.btn_stop, self.btn_watch, self.btn_other, self.btn_back]
+        self.name_field = TextField("NAME", "", max_len=32)
+        self.btn_save = Button("Save model", self._save_named, "primary")
+        self._save_msg, self._save_col, self._confirm_name = "", TEXT_DIM, None
+        self.widgets = [self.speed, self.btn_pause, self.btn_stop, self.btn_watch, self.btn_other, self.btn_back,
+                        self.name_field, self.btn_save]
 
     # ----------------------------------------------------------- actions
     def _pause(self):
@@ -631,6 +735,30 @@ class TrainScreen(Screen):
     def _back(self):
         self.app.go(SetupScreen(self.app))
 
+    def _save_named(self):
+        """Copy the best model of this training to its own file, under the name typed by the user."""
+        tr = self.trainer
+        name = self.name_field.value.strip()
+        if not tr or tr.best_genome is None:
+            self._save_msg, self._save_col = "no model to save yet", WARN
+            return
+        if not name:
+            self._save_msg, self._save_col = "type a name first", WARN
+            return
+        path = named_path(name)
+        if os.path.exists(path) and self._confirm_name != name:
+            self._confirm_name = name                   # a second click overwrites
+            self._save_msg, self._save_col = "name already used: click Overwrite? to replace it", WARN
+            return
+        try:
+            save_named(model_path(tr.key), name)
+        except OSError as e:
+            self._save_msg, self._save_col = f"could not save: {e}", BAD
+            return
+        self._confirm_name = None
+        self.app.model_path = path
+        self._save_msg, self._save_col = f"saved as '{name[:28]}'", GOOD
+
     def close(self):
         if self.trainer:
             self.trainer.close()
@@ -661,7 +789,8 @@ class TrainScreen(Screen):
                     device = "cpu"                          # no CUDA here: fall back to the CPU workers
                 self.trainer = LiveTrainer(self.app.generations, self.app.population, self.app.workers,
                                            spec=self.spec, track=self.track,
-                                           n_tracks=self.n_tracks if self.general else None, device=device)
+                                           n_tracks=self.n_tracks if self.general else None, device=device,
+                                           validate_every=self.app.val_every, val_circuits=self.app.val_circuits)
                 self.t_last = time.perf_counter()
             return
         tr = self.trainer
@@ -669,6 +798,17 @@ class TrainScreen(Screen):
         self.btn_pause.label = "Resume" if self.paused else "Pause"
         self.btn_pause.visible = self.btn_stop.visible = self.speed.visible = not done
         self.btn_watch.visible = self.btn_other.visible = done
+        self.name_field.visible = self.btn_save.visible = done
+        if done and not self.name_field.value and not getattr(self, "_name_set", False):
+            self._name_set = True                       # suggested name, editable
+            when = time.strftime("%Y-%m-%d %H%M")
+            self.name_field.set(f"Generalist k{tr.n_tracks} {when}" if self.general
+                                else f"{self.track.name} {when}")
+        self.btn_save.enabled = tr.best_genome is not None
+        if done and tr.best_genome is None and not self._save_msg:
+            self._save_msg, self._save_col = ("nothing to save yet: the first model is saved at the first validation"
+                                              if self.general else "nothing to save yet"), WARN
+        self.btn_save.label = "Overwrite?" if self._confirm_name == self.name_field.value.strip() else "Save model"
         self.btn_watch.enabled = self.btn_other.enabled = tr.best_genome is not None
         self.btn_back.rect = self.r_back_done if done else self.r_back_running
         if done or self.paused:
@@ -721,6 +861,8 @@ class TrainScreen(Screen):
         # when done: Watch | Try another on one row, Menu below
         y = h - 20 - 38 - 10 - 40
         half = (cw - 10) // 2
+        self.name_field.rect = pygame.Rect(x, y - 50, cw - 150, 38)
+        self.btn_save.rect = pygame.Rect(x + cw - 140, y - 50, 140, 38)
         self.btn_watch.rect = pygame.Rect(x, y, half, 40)
         self.btn_other.rect = pygame.Rect(x + half + 10, y, cw - half - 10, 40)
         self.r_back_done = pygame.Rect(x, y + 50, cw, 38)
@@ -904,14 +1046,19 @@ class TrainScreen(Screen):
             y = self._draw_validation_section(surf, x, y, cw)
 
         if tr.finished:
-            bottom = self.btn_watch.rect.y - 70
-            text(surf, "TRAINING COMPLETE", (x, bottom + 10), f.mid, GOOD)
+            bottom = self.name_field.rect.y - 92
+            stopped = len(tr.history) < tr.generations
+            text(surf, "TRAINING STOPPED" if stopped else "TRAINING COMPLETE", (x, bottom + 10), f.mid,
+                 WARN if stopped else GOOD)
+            text(surf, self._save_msg or "save it with a name to keep it apart from future trainings",
+                 (x, self.name_field.rect.y - 22), f.small, self._save_col)
             if self.general:
                 rv = tr.record_val
                 best = f"completes {rv['completed']:.0%} of unseen circuits" if rv else "not validated"
             else:
                 best = fmt_time(tr.record_lap) if tr.record_lap else "no full lap"
             text(surf, f"best model: {best}", (x, bottom + 40), f.normal, TEXT)
+            bottom -= 8
         else:
             bottom = self.speed.rect.y - 30
             text(surf, "SPEED  (Space pause, C follow)", (x, self.speed.rect.y - 22), f.small, TEXT_DIM)
@@ -920,7 +1067,10 @@ class TrainScreen(Screen):
         text(surf, "PROGRESS PER GENERATION", (x, y), f.small, TEXT_DIM)
         chart = pygame.Rect(x - 4, y + 22, cw + 8, bottom - y - 30)
         if chart.h >= 120:
-            (draw_chart_general if self.general else draw_chart)(surf, chart, tr.history, tr.generations)
+            if self.general:
+                draw_chart_general(surf, chart, tr.history, tr.generations, tr.validate_every)
+            else:
+                draw_chart(surf, chart, tr.history, tr.generations)
 
     def _draw_validation_section(self, surf, x, y, cw):
         """Left panel: countdown to the next validation, last result, best result."""
@@ -1037,6 +1187,7 @@ class App:
         self.model_path = None
         self.hint_test = False
         self.train_mode, self.n_circuits = "track", 8
+        self.val_every, self.val_circuits = VALIDATE_EVERY, VALIDATION_SIZE
         self.workers = DEFAULT_WORKERS
         self.has_torch = importlib.util.find_spec("torch") is not None
         self.device = "cpu"                                 # one track by default: CPU is faster there
