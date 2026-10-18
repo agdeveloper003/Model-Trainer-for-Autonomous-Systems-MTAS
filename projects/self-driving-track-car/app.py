@@ -1,5 +1,5 @@
 """
-MTAS app: one window, three screens.
+Self-Driving Track Car (an MTAS project): one window, three screens.
 
   Setup     choose the circuit (classic or random from a seed), then
             PLAY it yourself or start NEUROEVOLUTION; a trained model can
@@ -32,7 +32,8 @@ from trainer import (CRASHED, DONE, HEADING, LAP_TIME, PROGRESS, SPEED, VALIDATE
 from ui import (ACCENT, BAD, BG, BORDER, GOOD, PANEL, TEXT, TEXT_DIM, WARN, Button, Cycler, TextField,
                 NumberField, Segmented, Slider, bar, card, fonts, text, wrap)
 
-TITLE = "MTAS - Model Trainer for Autonomous Systems"
+PROJECT = "Self-Driving Track Car"
+TITLE = f"{PROJECT} - MTAS"
 MARGIN = 20
 # more worker processes than logical processors only adds overhead (they take turns on the same
 # core) and ~100 MB of memory each; by default 2 are left free for this window and the system
@@ -349,8 +350,8 @@ class SetupScreen(Screen):
     def render(self, surf):
         f = fonts()
         w = surf.get_width()
-        text(surf, "MTAS", (MARGIN, 22), f.title, ACCENT)
-        text(surf, "Model Trainer for Autonomous Systems", (MARGIN + 110, 36), f.normal, TEXT_DIM)
+        r = text(surf, PROJECT, (MARGIN, 22), f.title, ACCENT)
+        text(surf, "MTAS · Model Trainer for Autonomous Systems", (r.right + 20, 36), f.normal, TEXT_DIM)
         text(surf, "set up the circuit, then choose what to do", (w - MARGIN, 36), f.small, TEXT_DIM, "topright")
 
         # ---- track card
@@ -601,7 +602,7 @@ class DriveScreen(Screen):
         h = surf.get_height()
         pygame.draw.rect(surf, PANEL, (0, 0, self.PANEL_W, h))
         x, y = 20, 18
-        y += text(surf, "MTAS", (x, y), f.mid, ACCENT).h + 2
+        y += text(surf, PROJECT, (x, y + 4), f.bold, ACCENT).h + 8
         y += text(surf, f"{self.track.name}  {self.track.length / 1000:.2f} km", (x, y), f.small, TEXT_DIM).h + 4
         driver = "You (keyboard)" if self.model is None else "Neural network"
         y += text(surf, f"Driver: {driver}", (x, y), f.small, TEXT).h + 14

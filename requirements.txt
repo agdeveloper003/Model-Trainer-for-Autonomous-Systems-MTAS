@@ -1,7 +1,4 @@
-numpy>=1.24
-pygame>=2.5
-# if pygame does not install on your Python version, use this instead:
-# pygame-ce>=2.5
-
-# optional, for training on the GPU (NVIDIA, CUDA): install the CUDA build from pytorch.org
-# torch>=2.8
+# Installs the dependencies of every MTAS project.
+# Each project also has its own requirements.txt, to install only that one.
+# When a project is added, add its line here.
+-r projects/self-driving-track-car/requirements.txt
